@@ -1,0 +1,30 @@
+.DS_Store
+
+# Local release artifacts
+releases/
+
+# Frontend build/install artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# Python cache artifacts
+backend/__pycache__/
+backend/**/*.pyc
+**/__pycache__/
+
+# Local data is downloaded separately and should not be committed
+data/*
+!data/lineages_current/
+data/lineages_current/*
+!data/lineages_current/.gitkeep
+
+# Optional private sample data should not be committed
+sample_data/*
+!sample_data/README.md
+
+# Common local environment files
+.env
+.env.*
+.venv/

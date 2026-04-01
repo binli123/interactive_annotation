@@ -1,0 +1,28 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      INTERACTIVE_ANNOTATION_PROJECT_ROOT: /app
+      INTERACTIVE_ANNOTATION_DATA_ROOT: /data
+      INTERACTIVE_ANNOTATION_LINEAGE_ROOT: /data/lineages_current
+      INTERACTIVE_ANNOTATION_CORS_ORIGINS: http://127.0.0.1:${INTERACTIVE_ANNOTATION_PORT:-5173},http://localhost:${INTERACTIVE_ANNOTATION_PORT:-5173}
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE: /api
+        VITE_DEFAULT_FOLDER: /data/lineages_current
+    ports:
+      - "${INTERACTIVE_ANNOTATION_PORT:-5173}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

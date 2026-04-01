@@ -1,0 +1,993 @@
+import { create } from 'zustand'
+import { api } from './api'
+import type {
+  ClusterLabelEditorResponse,
+  DotplotResponse,
+  GeneCatalogResponse,
+  MarkerDiscoveryResponse,
+  MetadataResponse,
+  ObjectCard,
+  PaletteName,
+  PolygonRecord,
+  PromoteReannotLabelsResponse,
+  PropagateResponse,
+  ReferencePropagateResponse,
+  SaveClusterLabelsResponse,
+  SaveResponse,
+  SessionSummary,
+  UmapPoint
+} from './types'
+
+const defaultFolder =
+  import.meta.env.VITE_DEFAULT_FOLDER ?? '/data/lineages_current'
+
+const favoriteGenesStorageKey = 'interactive_annotation_favorite_genes'
+
+function randomSessionId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  return `session_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function randomPolygonId(): string {
+  return `polygon_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function loadFavoriteGenes(): string[] {
+  if (typeof window === 'undefined') {
+    return []
+  }
+  try {
+    const raw = window.localStorage.getItem(favoriteGenesStorageKey)
+    if (!raw) {
+      return []
+    }
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveFavoriteGenes(genes: string[]) {
+  if (typeof window === 'undefined') {
+    return
+  }
+  window.localStorage.setItem(favoriteGenesStorageKey, JSON.stringify(genes))
+}
+
+function moveArrayItem(values: string[], fromIndex: number, toIndex: number): string[] {
+  const next = [...values]
+  const [item] = next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, item)
+  return next
+}
+
+type PropagationScope =
+  | 'polygon_only'
+  | 'selected_clusters_only'
+  | 'same_connected_neighborhood'
+  | 'whole_lineage'
+
+export type StoreState = {
+  apiBase: string
+  folderPath: string
+  objects: ObjectCard[]
+  selectedObjectId: string
+  metadata?: MetadataResponse
+  points: UmapPoint[]
+  embeddingKey: string
+  clusterKey: string
+  maxPoints: number
+  minPerCluster: number
+  polygons: PolygonRecord[]
+  draftVertices: number[][]
+  isDrawing: boolean
+  propagationMethod: 'graph_diffusion' | 'knn_vote'
+  propagationScope: PropagationScope
+  minScore: number
+  minMargin: number
+  annotateAll: boolean
+  graphSmoothing: number
+  pointSize: number
+  pointOpacity: number
+  polygonStrokeWidth: number
+  paletteName: PaletteName
+  flipHorizontal: boolean
+  flipVertical: boolean
+  sessionId: string
+  sessionSummary?: SessionSummary
+  propagationResult?: PropagateResponse
+  saveResult?: SaveResponse
+  promoteReannotResult?: PromoteReannotLabelsResponse
+  clusterLabelEditor?: ClusterLabelEditorResponse
+  clusterLabelSaveResult?: SaveClusterLabelsResponse
+  clusterVisibility: Record<string, boolean>
+  referenceClusters: string[]
+  sourceClusters: string[]
+  referencePropagationName: string
+  referencePropagationNeighbors: number
+  referencePropagationResult?: ReferencePropagateResponse
+  geneCatalog?: GeneCatalogResponse
+  geneSearch: string
+  selectedGenes: string[]
+  favoriteGenes: string[]
+  geneColorGene?: string
+  dotplotResult?: DotplotResponse
+  markerDiscoveryTargets: string[]
+  markerDiscoveryTopN: number
+  markerDiscoveryResult?: MarkerDiscoveryResponse
+  colorMode: 'cluster' | 'annotation' | 'gene'
+  busy: boolean
+  error?: string
+  scanFolder: () => Promise<void>
+  selectObject: (objectId: string) => Promise<void>
+  setFolderPath: (value: string) => void
+  setEmbeddingKey: (value: string) => void
+  setClusterKey: (value: string) => void
+  setMaxPoints: (value: number) => void
+  setMinPerCluster: (value: number) => void
+  setColorMode: (value: 'cluster' | 'annotation' | 'gene') => void
+  setPropagationMethod: (value: 'graph_diffusion' | 'knn_vote') => void
+  setPropagationScope: (value: PropagationScope) => void
+  setMinScore: (value: number) => void
+  setMinMargin: (value: number) => void
+  setAnnotateAll: (value: boolean) => void
+  setGraphSmoothing: (value: number) => void
+  setPointSize: (value: number) => void
+  setPointOpacity: (value: number) => void
+  setPolygonStrokeWidth: (value: number) => void
+  setPaletteName: (value: PaletteName) => void
+  setFlipHorizontal: (value: boolean) => void
+  setFlipVertical: (value: boolean) => void
+  setClusterVisibility: (clusterId: string, visible: boolean) => void
+  restoreClusterColorView: () => void
+  promoteReannotNewToCanonical: () => Promise<void>
+  toggleReferenceCluster: (clusterId: string) => void
+  toggleSourceCluster: (clusterId: string) => void
+  setReferencePropagationName: (value: string) => void
+  setReferencePropagationNeighbors: (value: number) => void
+  runReferencePropagation: () => Promise<void>
+  startDrawing: () => void
+  stopDrawing: () => void
+  addDraftVertex: (vertex: number[]) => void
+  undoDraftVertex: () => void
+  finalizeDraftPolygon: () => Promise<void>
+  clearDraftPolygon: () => void
+  updatePolygon: (polygonId: string, updates: Partial<PolygonRecord>) => void
+  removePolygon: (polygonId: string) => void
+  clearPolygons: () => void
+  loadUmap: (overrides?: {
+    embeddingKey?: string
+    clusterKey?: string
+    geneName?: string | null
+  }) => Promise<void>
+  refreshPointClusters: (clusterKey?: string) => Promise<void>
+  propagate: () => Promise<void>
+  refreshSessionSummary: () => Promise<void>
+  saveSession: () => Promise<void>
+  resetPropagation: () => Promise<void>
+  resetSession: () => Promise<void>
+  loadClusterLabelEditor: () => Promise<void>
+  updateClusterLabelName: (clusterId: string, displayName: string) => void
+  saveClusterLabelEditor: () => Promise<void>
+  loadGenes: () => Promise<void>
+  setGeneSearch: (value: string) => void
+  toggleGeneSelected: (gene: string) => void
+  clearSelectedGenes: () => void
+  toggleFavoriteGene: (gene: string) => void
+  reorderSelectedGenes: (fromIndex: number, toIndex: number) => void
+  toggleMarkerDiscoveryTarget: (clusterId: string) => void
+  setMarkerDiscoveryTopN: (value: number) => void
+  discoverMarkers: () => Promise<void>
+  colorBySelectedGene: () => Promise<void>
+  previewDotplot: () => Promise<void>
+  saveDotplot: () => Promise<void>
+}
+
+export const useStore = create<StoreState>((set, get) => ({
+  apiBase: import.meta.env.VITE_API_BASE ?? '/api',
+  folderPath: defaultFolder,
+  objects: [],
+  selectedObjectId: '',
+  metadata: undefined,
+  points: [],
+  embeddingKey: '',
+  clusterKey: '',
+  maxPoints: 50000,
+  minPerCluster: 250,
+  polygons: [],
+  draftVertices: [],
+  isDrawing: false,
+  propagationMethod: 'knn_vote',
+  propagationScope: 'selected_clusters_only',
+  minScore: 0.7,
+  minMargin: 0.1,
+  annotateAll: true,
+  graphSmoothing: 0.15,
+  pointSize: 2.2,
+  pointOpacity: 0.8,
+  polygonStrokeWidth: 1.25,
+  paletteName: 'bright',
+  flipHorizontal: false,
+  flipVertical: false,
+  sessionId: randomSessionId(),
+  sessionSummary: undefined,
+  propagationResult: undefined,
+  saveResult: undefined,
+  promoteReannotResult: undefined,
+  clusterLabelEditor: undefined,
+  clusterLabelSaveResult: undefined,
+  clusterVisibility: {},
+  referenceClusters: [],
+  sourceClusters: [],
+  referencePropagationName: 'new',
+  referencePropagationNeighbors: 15,
+  referencePropagationResult: undefined,
+  geneCatalog: undefined,
+  geneSearch: '',
+  selectedGenes: [],
+  favoriteGenes: loadFavoriteGenes(),
+  geneColorGene: undefined,
+  dotplotResult: undefined,
+  markerDiscoveryTargets: [],
+  markerDiscoveryTopN: 10,
+  markerDiscoveryResult: undefined,
+  colorMode: 'cluster',
+  busy: false,
+  error: undefined,
+
+  async scanFolder() {
+    set({ busy: true, error: undefined })
+    try {
+      const objects = await api.scanFolder(get().apiBase, get().folderPath)
+      const preferredObject = objects.find((object) => object.is_valid) ?? objects[0]
+      set({ objects, selectedObjectId: preferredObject?.object_id ?? '', busy: false })
+      if (preferredObject?.is_valid) {
+        await get().selectObject(preferredObject.object_id)
+      } else if (preferredObject) {
+        set({
+          error:
+            preferredObject.validation_error ??
+            `Object cannot be viewed interactively: ${preferredObject.object_path}`
+        })
+      }
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async selectObject(objectId) {
+    set({
+      busy: true,
+      error: undefined,
+      selectedObjectId: objectId,
+      metadata: undefined,
+      points: [],
+      polygons: [],
+      draftVertices: [],
+      isDrawing: false,
+      colorMode: 'cluster',
+      sessionId: randomSessionId(),
+      sessionSummary: undefined,
+      propagationResult: undefined,
+      saveResult: undefined,
+      promoteReannotResult: undefined,
+      clusterLabelEditor: undefined,
+      clusterLabelSaveResult: undefined,
+      clusterVisibility: {},
+      referenceClusters: [],
+      sourceClusters: [],
+      referencePropagationName: 'new',
+      referencePropagationResult: undefined,
+      propagationMethod: 'knn_vote',
+      annotateAll: true,
+      geneCatalog: undefined,
+      geneSearch: '',
+      selectedGenes: [],
+      geneColorGene: undefined,
+      dotplotResult: undefined,
+      markerDiscoveryTargets: [],
+      markerDiscoveryResult: undefined
+    })
+    try {
+      const metadata = await api.getMetadata(get().apiBase, objectId)
+      set({
+        metadata,
+        embeddingKey: metadata.default_embedding_key,
+        clusterKey: metadata.default_cluster_key ?? '',
+        busy: false
+      })
+      await get().loadUmap({
+        embeddingKey: metadata.default_embedding_key,
+        clusterKey: metadata.default_cluster_key ?? '',
+        geneName: null
+      })
+      await Promise.all([get().loadClusterLabelEditor(), get().loadGenes()])
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  setFolderPath(value) {
+    set({ folderPath: value })
+  },
+  setEmbeddingKey(value) {
+    set({ embeddingKey: value })
+  },
+  setClusterKey(value) {
+    set({
+      clusterKey: value,
+      dotplotResult: undefined,
+      geneColorGene: undefined,
+      colorMode: 'cluster',
+      referenceClusters: [],
+      sourceClusters: [],
+      referencePropagationResult: undefined,
+      markerDiscoveryTargets: [],
+      markerDiscoveryResult: undefined
+    })
+  },
+  setMaxPoints(value) {
+    set({ maxPoints: value })
+  },
+  setMinPerCluster(value) {
+    set({ minPerCluster: value })
+  },
+  setColorMode(value) {
+    set({ colorMode: value })
+  },
+  setPropagationMethod(value) {
+    set({ propagationMethod: value })
+  },
+  setPropagationScope(value) {
+    set({ propagationScope: value })
+  },
+  setMinScore(value) {
+    set({ minScore: value })
+  },
+  setMinMargin(value) {
+    set({ minMargin: value })
+  },
+  setAnnotateAll(value) {
+    set({ annotateAll: value })
+  },
+  setGraphSmoothing(value) {
+    set({ graphSmoothing: value })
+  },
+  setPointSize(value) {
+    set({ pointSize: value })
+  },
+  setPointOpacity(value) {
+    set({ pointOpacity: value })
+  },
+  setPolygonStrokeWidth(value) {
+    set({ polygonStrokeWidth: value })
+  },
+  setPaletteName(value) {
+    set({ paletteName: value })
+  },
+  setFlipHorizontal(value) {
+    set({ flipHorizontal: value })
+  },
+  setFlipVertical(value) {
+    set({ flipVertical: value })
+  },
+  setClusterVisibility(clusterId, visible) {
+    set((state) => ({
+      clusterVisibility: {
+        ...state.clusterVisibility,
+        [clusterId]: visible
+      }
+    }))
+  },
+  restoreClusterColorView() {
+    set({ colorMode: 'cluster' })
+  },
+  async promoteReannotNewToCanonical() {
+    const { selectedObjectId } = get()
+    if (!selectedObjectId) {
+      set({ error: 'Select an object first.' })
+      return
+    }
+    set({ busy: true, error: undefined, promoteReannotResult: undefined })
+    try {
+      const result = await api.promoteReannotNew(get().apiBase, selectedObjectId)
+      const metadata = await api.getMetadata(get().apiBase, selectedObjectId)
+      set({
+        metadata,
+        clusterKey: 'reannot_label',
+        promoteReannotResult: result,
+        colorMode: 'cluster',
+        busy: false
+      })
+      await get().loadClusterLabelEditor()
+      await get().refreshPointClusters('reannot_label')
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  toggleReferenceCluster(clusterId) {
+    set((state) => ({
+      referenceClusters: state.referenceClusters.includes(clusterId)
+        ? state.referenceClusters.filter((value) => value !== clusterId)
+        : [...state.referenceClusters, clusterId],
+      sourceClusters: state.sourceClusters.filter((value) => value !== clusterId)
+    }))
+  },
+  toggleSourceCluster(clusterId) {
+    set((state) => ({
+      sourceClusters: state.sourceClusters.includes(clusterId)
+        ? state.sourceClusters.filter((value) => value !== clusterId)
+        : [...state.sourceClusters, clusterId],
+      referenceClusters: state.referenceClusters.filter((value) => value !== clusterId)
+    }))
+  },
+  setReferencePropagationName(value) {
+    set({ referencePropagationName: value })
+  },
+  setReferencePropagationNeighbors(value) {
+    set({ referencePropagationNeighbors: value })
+  },
+
+  startDrawing() {
+    set({ isDrawing: true, draftVertices: [], error: undefined })
+  },
+  stopDrawing() {
+    set({ isDrawing: false })
+  },
+  addDraftVertex(vertex) {
+    if (!get().isDrawing) {
+      return
+    }
+    set((state) => ({ draftVertices: [...state.draftVertices, vertex] }))
+  },
+  undoDraftVertex() {
+    set((state) => ({ draftVertices: state.draftVertices.slice(0, -1) }))
+  },
+  async finalizeDraftPolygon() {
+    const { selectedObjectId, embeddingKey, clusterKey, draftVertices } = get()
+    if (draftVertices.length < 3) {
+      set({ error: 'A polygon needs at least three points.' })
+      return
+    }
+    if (!selectedObjectId || !embeddingKey || !clusterKey) {
+      set({ error: 'Select an object, embedding key, and cluster key first.' })
+      return
+    }
+
+    const polygonId = randomPolygonId()
+    const vertices = [...draftVertices, draftVertices[0]]
+    set({ busy: true, error: undefined })
+    try {
+      const selection = await api.polygonSelect(get().apiBase, selectedObjectId, {
+        embedding_key: embeddingKey,
+        cluster_key: clusterKey,
+        polygons: [{ polygon_id: polygonId, vertices }]
+      })
+      const summary = selection.polygon_summaries[0]
+      const dominantCluster = summary?.clusters[0]?.cluster ?? ''
+      const polygon: PolygonRecord = {
+        id: polygonId,
+        vertices,
+        clusterId: dominantCluster,
+        clusterName: '',
+        includeForPropagation: true,
+        nCells: summary?.n_cells ?? 0,
+        clusterSummary: summary?.clusters ?? []
+      }
+      set((state) => ({
+        polygons: [...state.polygons, polygon],
+        draftVertices: [],
+        isDrawing: false,
+        busy: false
+      }))
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  clearDraftPolygon() {
+    set({ draftVertices: [] })
+  },
+  updatePolygon(polygonId, updates) {
+    set((state) => ({
+      polygons: state.polygons.map((polygon) =>
+        polygon.id === polygonId ? { ...polygon, ...updates } : polygon
+      )
+    }))
+  },
+  removePolygon(polygonId) {
+    set((state) => ({
+      polygons: state.polygons.filter((polygon) => polygon.id !== polygonId)
+    }))
+  },
+  clearPolygons() {
+    set({ polygons: [], draftVertices: [], isDrawing: false })
+  },
+
+  async loadUmap(overrides) {
+    const { selectedObjectId, embeddingKey, clusterKey, maxPoints, minPerCluster, colorMode, geneColorGene } =
+      get()
+    const nextEmbeddingKey = overrides?.embeddingKey ?? embeddingKey
+    const nextClusterKey = overrides?.clusterKey ?? clusterKey
+    const nextGeneName =
+      overrides?.geneName !== undefined ? overrides.geneName : colorMode === 'gene' ? geneColorGene ?? null : null
+    if (!selectedObjectId || !nextEmbeddingKey) {
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const response = await api.getUmap(get().apiBase, selectedObjectId, {
+        embedding_key: nextEmbeddingKey,
+        cluster_key: nextClusterKey || null,
+        gene_name: nextGeneName,
+        max_points: maxPoints,
+        min_per_cluster: minPerCluster,
+        random_seed: 13
+      })
+      set({ points: response.points, busy: false })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async refreshPointClusters(nextClusterKey) {
+    const { selectedObjectId, clusterKey, points } = get()
+    const effectiveClusterKey = nextClusterKey ?? clusterKey
+    if (!selectedObjectId || !effectiveClusterKey || points.length === 0) {
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const response = await api.getPointClusters(get().apiBase, selectedObjectId, {
+        cluster_key: effectiveClusterKey,
+        indices: points.map((point) => point.index)
+      })
+      const clusterMap = new Map(response.values.map((row) => [row.index, row.cluster] as const))
+      set((state) => ({
+        points: state.points.map((point) => ({
+          ...point,
+          cluster: clusterMap.get(point.index) ?? point.cluster
+        })),
+        busy: false
+      }))
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async loadClusterLabelEditor() {
+    const { selectedObjectId, clusterKey, clusterVisibility } = get()
+    if (!selectedObjectId || !clusterKey) {
+      set({ clusterLabelEditor: undefined, clusterVisibility: {} })
+      return
+    }
+    try {
+      const editor = await api.getClusterLabelEditor(get().apiBase, selectedObjectId, clusterKey)
+      const nextVisibility = Object.fromEntries(
+        editor.rows.map((row) => [row.cluster_id, clusterVisibility[row.cluster_id] ?? true])
+      )
+      set({
+        clusterLabelEditor: editor,
+        clusterLabelSaveResult: undefined,
+        clusterVisibility: nextVisibility
+      })
+    } catch (error) {
+      set({
+        clusterLabelEditor: undefined,
+        clusterVisibility: {},
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  updateClusterLabelName(clusterId, displayName) {
+    set((state) => ({
+      clusterLabelEditor: state.clusterLabelEditor
+        ? {
+            ...state.clusterLabelEditor,
+            rows: state.clusterLabelEditor.rows.map((row) =>
+              row.cluster_id === clusterId ? { ...row, display_name: displayName } : row
+            )
+          }
+        : undefined
+    }))
+  },
+
+  async saveClusterLabelEditor() {
+    const { selectedObjectId, clusterLabelEditor, clusterKey } = get()
+    if (!selectedObjectId || !clusterLabelEditor || !clusterKey) {
+      return
+    }
+    const mapping = Object.fromEntries(
+      clusterLabelEditor.rows
+        .map((row) => [row.cluster_id, (row.display_name ?? '').trim()] as const)
+        .filter(([, displayName]) => displayName.length > 0)
+    )
+    set({ busy: true, error: undefined, clusterLabelSaveResult: undefined })
+    try {
+      const result = await api.saveClusterLabelEditor(get().apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        display_column: clusterLabelEditor.display_column,
+        mapping
+      })
+      const metadata = await api.getMetadata(get().apiBase, selectedObjectId)
+      set({
+        metadata,
+        clusterLabelSaveResult: result,
+        busy: false
+      })
+      await get().loadClusterLabelEditor()
+      await get().loadUmap({ clusterKey: get().clusterKey })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async runReferencePropagation() {
+    const {
+      selectedObjectId,
+      clusterKey,
+      referenceClusters,
+      sourceClusters,
+      referencePropagationName,
+      referencePropagationNeighbors
+    } = get()
+    if (!selectedObjectId || !clusterKey) {
+      set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (referenceClusters.length === 0 || sourceClusters.length === 0) {
+      set({ error: 'Select at least one reference cluster and one source cluster.' })
+      return
+    }
+    set({ busy: true, error: undefined, referencePropagationResult: undefined })
+    try {
+      const result = await api.referencePropagate(get().apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        reference_clusters: referenceClusters,
+        source_clusters: sourceClusters,
+        output_name: referencePropagationName.trim() || 'new',
+        n_neighbors: referencePropagationNeighbors
+      })
+      await get().selectObject(selectedObjectId)
+      set({
+        clusterKey: result.new_cluster_key,
+        colorMode: 'cluster',
+        referencePropagationResult: result,
+        referenceClusters: [],
+        sourceClusters: [],
+        markerDiscoveryTargets: [],
+        markerDiscoveryResult: undefined
+      })
+      await get().loadClusterLabelEditor()
+      await get().loadUmap({ clusterKey: result.new_cluster_key, geneName: null })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async loadGenes() {
+    const { selectedObjectId } = get()
+    if (!selectedObjectId) {
+      set({ geneCatalog: undefined, selectedGenes: [], dotplotResult: undefined })
+      return
+    }
+    try {
+      const geneCatalog = await api.getGenes(get().apiBase, selectedObjectId)
+      set((state) => ({
+        geneCatalog,
+        selectedGenes: state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+        dotplotResult: undefined
+      }))
+    } catch (error) {
+      set({
+        geneCatalog: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  setGeneSearch(value) {
+    set({ geneSearch: value })
+  },
+  toggleGeneSelected(gene) {
+    set((state) => {
+      const selected = state.selectedGenes.includes(gene)
+        ? state.selectedGenes.filter((value) => value !== gene)
+        : [...state.selectedGenes, gene]
+      return {
+        selectedGenes: selected,
+        dotplotResult: undefined
+      }
+    })
+  },
+  clearSelectedGenes() {
+    set({ selectedGenes: [], dotplotResult: undefined })
+  },
+  toggleFavoriteGene(gene) {
+    set((state) => {
+      const favoriteGenes = state.favoriteGenes.includes(gene)
+        ? state.favoriteGenes.filter((value) => value !== gene)
+        : [gene, ...state.favoriteGenes]
+      saveFavoriteGenes(favoriteGenes)
+      return { favoriteGenes }
+    })
+  },
+  reorderSelectedGenes(fromIndex, toIndex) {
+    set((state) => {
+      if (
+        fromIndex < 0 ||
+        toIndex < 0 ||
+        fromIndex >= state.selectedGenes.length ||
+        toIndex >= state.selectedGenes.length ||
+        fromIndex === toIndex
+      ) {
+        return state
+      }
+      return { selectedGenes: moveArrayItem(state.selectedGenes, fromIndex, toIndex), dotplotResult: undefined }
+    })
+  },
+  toggleMarkerDiscoveryTarget(clusterId) {
+    set((state) => ({
+      markerDiscoveryTargets: state.markerDiscoveryTargets.includes(clusterId)
+        ? state.markerDiscoveryTargets.filter((value) => value !== clusterId)
+        : [...state.markerDiscoveryTargets, clusterId]
+    }))
+  },
+  setMarkerDiscoveryTopN(value) {
+    set({ markerDiscoveryTopN: value })
+  },
+  async discoverMarkers() {
+    const { selectedObjectId, clusterKey, clusterLabelEditor, clusterVisibility, markerDiscoveryTargets, markerDiscoveryTopN } =
+      get()
+    if (!selectedObjectId || !clusterKey || !clusterLabelEditor) {
+      set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    const activeClusters = clusterLabelEditor.rows
+      .map((row) => row.cluster_id)
+      .filter((clusterId) => clusterVisibility[clusterId] ?? true)
+    if (activeClusters.length === 0) {
+      set({ error: 'At least one checked cluster is required for marker discovery.' })
+      return
+    }
+    if (markerDiscoveryTargets.length === 0) {
+      set({ error: 'Select at least one target cluster for marker discovery.' })
+      return
+    }
+    set({ busy: true, error: undefined, markerDiscoveryResult: undefined })
+    try {
+      const result = await api.discoverMarkers(get().apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        active_clusters: activeClusters,
+        target_clusters: markerDiscoveryTargets,
+        top_n: markerDiscoveryTopN
+      })
+      set((state) => ({
+        markerDiscoveryResult: result,
+        selectedGenes: [...state.selectedGenes, ...result.candidate_genes.filter((gene) => !state.selectedGenes.includes(gene))],
+        busy: false
+      }))
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  async colorBySelectedGene() {
+    const { selectedGenes, selectedObjectId, points, geneColorGene, colorMode } = get()
+    if (selectedGenes.length !== 1) {
+      set({ error: 'Check exactly one gene to color the UMAP by expression.' })
+      return
+    }
+    const gene = selectedGenes[0]
+    if (!selectedObjectId) {
+      set({ error: 'Select an object first.' })
+      return
+    }
+    if (colorMode === 'gene' && geneColorGene === gene && points.every((point) => point.gene_expression != null)) {
+      set({ colorMode: 'gene' })
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const response = await api.getGeneExpression(get().apiBase, selectedObjectId, {
+        gene_name: gene,
+        indices: points.map((point) => point.index)
+      })
+      const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
+      set((state) => ({
+        points: state.points.map((point) => ({
+          ...point,
+          gene_expression: expressionMap.get(point.index) ?? 0
+        })),
+        colorMode: 'gene',
+        geneColorGene: gene,
+        busy: false
+      }))
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  async previewDotplot() {
+    const { selectedObjectId, clusterKey, selectedGenes } = get()
+    if (!selectedObjectId || !clusterKey) {
+      set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (selectedGenes.length === 0) {
+      set({ error: 'Check at least one gene for the dotplot.' })
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const dotplotResult = await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        genes: selectedGenes,
+        save_to_object_dir: false
+      })
+      set({ dotplotResult, busy: false })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  async saveDotplot() {
+    const { selectedObjectId, clusterKey, selectedGenes } = get()
+    if (!selectedObjectId || !clusterKey) {
+      set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (selectedGenes.length === 0) {
+      set({ error: 'Check at least one gene for the dotplot.' })
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const dotplotResult = await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        genes: selectedGenes,
+        save_to_object_dir: true
+      })
+      set({ dotplotResult, busy: false })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async propagate() {
+    const {
+      selectedObjectId,
+      embeddingKey,
+      clusterKey,
+      polygons,
+      propagationMethod,
+      propagationScope,
+      minScore,
+      minMargin,
+      annotateAll,
+      graphSmoothing
+    } = get()
+
+    if (!selectedObjectId || !embeddingKey || !clusterKey) {
+      set({ error: 'Select an object, embedding key, and cluster key first.' })
+      return
+    }
+
+    const activePolygons = polygons.filter(
+      (polygon) => polygon.includeForPropagation && polygon.vertices.length >= 3 && polygon.clusterId.trim()
+    )
+    if (activePolygons.length === 0) {
+      set({ error: 'Tick at least one polygon and give it a cluster ID before propagating.' })
+      return
+    }
+
+    const sessionId = randomSessionId()
+    set({ busy: true, error: undefined, sessionId, saveResult: undefined, propagationResult: undefined })
+    try {
+      let sessionSummary: SessionSummary | undefined
+      for (const polygon of activePolygons) {
+        sessionSummary = await api.seedLabels(get().apiBase, selectedObjectId, {
+          session_id: sessionId,
+          embedding_key: embeddingKey,
+          cluster_key: clusterKey,
+          label: polygon.clusterId.trim(),
+          display_name: polygon.clusterName.trim() || polygon.clusterId.trim(),
+          notes: null,
+          polygons: [{ polygon_id: polygon.id, vertices: polygon.vertices }]
+        })
+      }
+
+      const propagationResult = await api.propagate(get().apiBase, selectedObjectId, {
+        session_id: sessionId,
+        embedding_key: embeddingKey,
+        cluster_key: clusterKey,
+        method: propagationMethod,
+        scope: propagationScope,
+        min_score: minScore,
+        min_margin: minMargin,
+        annotate_all: annotateAll,
+        graph_smoothing: graphSmoothing,
+        n_neighbors: 15,
+        neighborhood_hops: 2
+      })
+
+      set({
+        sessionSummary,
+        propagationResult,
+        colorMode: 'annotation',
+        busy: false
+      })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async refreshSessionSummary() {
+    const { selectedObjectId, sessionId } = get()
+    if (!selectedObjectId) {
+      return
+    }
+    try {
+      const sessionSummary = await api.sessionSummary(get().apiBase, selectedObjectId, sessionId)
+      set({ sessionSummary })
+    } catch {
+      // Ignore empty sessions.
+    }
+  },
+
+  async saveSession() {
+    const { selectedObjectId, sessionId, propagationResult } = get()
+    if (!selectedObjectId || !propagationResult) {
+      set({ error: 'Run propagation before saving.' })
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const saveResult = await api.save(get().apiBase, selectedObjectId, { session_id: sessionId })
+      set({ saveResult, busy: false })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async resetPropagation() {
+    const { selectedObjectId, sessionId } = get()
+    if (selectedObjectId) {
+      try {
+        await api.clearSession(get().apiBase, selectedObjectId, sessionId)
+      } catch {
+        // Session may not exist yet.
+      }
+    }
+    set({
+      sessionId: randomSessionId(),
+      sessionSummary: undefined,
+      propagationResult: undefined,
+      saveResult: undefined,
+      colorMode: 'cluster',
+      error: undefined
+    })
+  },
+
+  async resetSession() {
+    const { selectedObjectId, sessionId } = get()
+    if (selectedObjectId) {
+      try {
+        await api.clearSession(get().apiBase, selectedObjectId, sessionId)
+      } catch {
+        // Session may not exist yet.
+      }
+    }
+    set({
+      polygons: [],
+      draftVertices: [],
+      isDrawing: false,
+      sessionId: randomSessionId(),
+      sessionSummary: undefined,
+      propagationResult: undefined,
+      saveResult: undefined,
+      colorMode: 'cluster',
+      error: undefined
+    })
+  }
+}))

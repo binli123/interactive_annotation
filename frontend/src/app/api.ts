@@ -5,6 +5,10 @@ import type {
   GeneExpressionResponse,
   MarkerDiscoveryResponse,
   MetadataResponse,
+  MoveClusterPreviewResponse,
+  MoveClusterResponse,
+  MoveClusterUndoResponse,
+  MoveClusterUndoStatusResponse,
   ObjectCard,
   PolygonSelectResponse,
   PropagateResponse,
@@ -45,6 +49,9 @@ export const api = {
   getMetadata(baseUrl: string, objectId: string) {
     return requestJson<MetadataResponse>(`${baseUrl}/objects/${objectId}/metadata`)
   },
+  getGlobalMetadata(baseUrl: string) {
+    return requestJson<MetadataResponse>(`${baseUrl}/global/metadata`)
+  },
   getGenes(baseUrl: string, objectId: string) {
     return requestJson<GeneCatalogResponse>(`${baseUrl}/objects/${objectId}/genes`)
   },
@@ -56,6 +63,12 @@ export const api = {
   },
   getPointClusters(baseUrl: string, objectId: string, payload: { cluster_key: string; indices: number[] }) {
     return requestJson<PointClusterResponse>(`${baseUrl}/objects/${objectId}/point-clusters`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  getGlobalPointClusters(baseUrl: string, payload: { cluster_key: string; indices: number[] }) {
+    return requestJson<PointClusterResponse>(`${baseUrl}/global/point-clusters`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })
@@ -142,6 +155,40 @@ export const api = {
       body: JSON.stringify(payload)
     })
   },
+  getGlobalUmap(
+    baseUrl: string,
+    payload: {
+      embedding_key: string
+      cluster_key?: string | null
+      gene_name?: string | null
+      max_points: number
+      min_per_cluster: number
+      random_seed: number
+    }
+  ) {
+    return requestJson<UmapResponse>(`${baseUrl}/global/umap`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  highlightGlobalFromObject(
+    baseUrl: string,
+    payload: {
+      source_object_id: string
+      source_cluster_key: string
+      source_cluster_id: string
+      embedding_key: string
+      cluster_key?: string | null
+      max_points: number
+      min_per_cluster: number
+      random_seed: number
+    }
+  ) {
+    return requestJson<UmapResponse>(`${baseUrl}/global/highlight-from-object`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
   polygonSelect(
     baseUrl: string,
     objectId: string,
@@ -185,6 +232,43 @@ export const api = {
   },
   save(baseUrl: string, objectId: string, payload: Record<string, unknown>) {
     return requestJson<SaveResponse>(`${baseUrl}/objects/${objectId}/save`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  moveCluster(
+    baseUrl: string,
+    objectId: string,
+    payload: {
+      destination_object_id: string
+      cluster_key: string
+      cluster_id: string
+      allow_overwrite?: boolean
+    }
+  ) {
+    return requestJson<MoveClusterResponse>(`${baseUrl}/objects/${objectId}/move-cluster`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  getMoveClusterUndoStatus(baseUrl: string) {
+    return requestJson<MoveClusterUndoStatusResponse>(`${baseUrl}/move-cluster-undo`)
+  },
+  undoMoveCluster(baseUrl: string) {
+    return requestJson<MoveClusterUndoResponse>(`${baseUrl}/move-cluster-undo`, {
+      method: 'POST'
+    })
+  },
+  previewMoveCluster(
+    baseUrl: string,
+    objectId: string,
+    payload: {
+      destination_object_id: string
+      cluster_key: string
+      cluster_id: string
+    }
+  ) {
+    return requestJson<MoveClusterPreviewResponse>(`${baseUrl}/objects/${objectId}/move-cluster-preview`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })

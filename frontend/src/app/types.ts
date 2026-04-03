@@ -41,6 +41,7 @@ export type UmapPoint = {
   current_label?: string | null
   current_score?: number | null
   gene_expression?: number | null
+  is_highlighted?: boolean | null
 }
 
 export type UmapResponse = {
@@ -50,6 +51,8 @@ export type UmapResponse = {
   gene_name?: string | null
   total_cells: number
   displayed_cells: number
+  highlighted_total?: number | null
+  highlighted_displayed?: number | null
   points: UmapPoint[]
 }
 
@@ -170,6 +173,62 @@ export type SaveClusterLabelsResponse = {
   cluster_key: string
   display_column: string
   n_updated: number
+}
+
+export type MoveClusterResponse = {
+  source_object_id: string
+  source_object_path: string
+  destination_object_id: string
+  destination_object_path: string
+  cluster_key: string
+  cluster_id: string
+  display_name: string
+  n_moved_cells: number
+  n_overwritten_cells: number
+}
+
+export type MoveClusterPreviewResponse = {
+  source_object_id: string
+  source_object_path: string
+  destination_object_id: string
+  destination_object_path: string
+  cluster_key: string
+  source_cluster_id: string
+  assigned_cluster_id: string
+  display_name: string
+  n_moved_cells: number
+  n_overwritten_cells: number
+}
+
+export type MoveClusterUndoStatusResponse = {
+  available: boolean
+  source_object_id?: string | null
+  source_object_path?: string | null
+  destination_object_id?: string | null
+  destination_object_path?: string | null
+  cluster_key?: string | null
+  source_cluster_id?: string | null
+  assigned_cluster_id?: string | null
+  display_name?: string | null
+  n_moved_cells?: number | null
+  n_overwritten_cells?: number | null
+  created_at?: string | null
+}
+
+export type MoveClusterUndoResponse = {
+  available: boolean
+  restored: boolean
+  source_object_id: string
+  source_object_path: string
+  destination_object_id: string
+  destination_object_path: string
+  cluster_key: string
+  source_cluster_id: string
+  assigned_cluster_id: string
+  display_name: string
+  n_moved_cells: number
+  n_overwritten_cells: number
+  created_at: string
 }
 
 export type GeneCatalogResponse = {

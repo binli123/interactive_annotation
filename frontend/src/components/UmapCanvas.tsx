@@ -5,6 +5,8 @@ import { PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { useStore } from '../app/store'
 import type { PaletteName, PolygonRecord, UmapPoint } from '../app/types'
 
+type ViewMode = 'lineage' | 'global'
+
 type RenderPoint = UmapPoint & {
   annotationLabel: string
   annotationScore?: number
@@ -76,13 +78,13 @@ function transformVertex(
   ]
 }
 
-export default function UmapCanvas() {
+export default function UmapCanvas({ mode }: { mode: ViewMode }) {
   const frameRef = useRef<HTMLDivElement | null>(null)
   const state = useStore((store) => ({
-    points: store.points,
-    polygons: store.polygons,
-    draftVertices: store.draftVertices,
-    isDrawing: store.isDrawing,
+    points: mode === 'lineage' ? store.points : store.globalPoints,
+    polygons: mode === 'lineage' ? store.polygons : [],
+    draftVertices: mode === 'lineage' ? store.draftVertices : [],
+    isDrawing: mode === 'lineage' ? store.isDrawing : false,
     startDrawing: store.startDrawing,
     stopDrawing: store.stopDrawing,
     addDraftVertex: store.addDraftVertex,
@@ -90,26 +92,29 @@ export default function UmapCanvas() {
     finalizeDraftPolygon: store.finalizeDraftPolygon,
     clearDraftPolygon: store.clearDraftPolygon,
     clearPolygons: store.clearPolygons,
-    propagationResult: store.propagationResult,
-    colorMode: store.colorMode,
-    clusterVisibility: store.clusterVisibility,
-    geneColorGene: store.geneColorGene,
+    propagationResult: mode === 'lineage' ? store.propagationResult : undefined,
+    colorMode: mode === 'lineage' ? store.colorMode : 'cluster',
+    clusterVisibility: mode === 'lineage' ? store.clusterVisibility : {},
+    geneColorGene: mode === 'lineage' ? store.geneColorGene : undefined,
     pointSize: store.pointSize,
     pointOpacity: store.pointOpacity,
     paletteName: store.paletteName,
     polygonStrokeWidth: store.polygonStrokeWidth,
     flipHorizontal: store.flipHorizontal,
-    flipVertical: store.flipVertical
+    flipVertical: store.flipVertical,
+    globalHighlight: store.globalHighlight
   }))
   const visibleBasePoints = useMemo(
     () =>
-      state.points.filter((point) => {
-        if (!point.cluster) {
-          return true
-        }
-        return state.clusterVisibility[point.cluster] ?? true
-      }),
-    [state.clusterVisibility, state.points]
+      mode === 'lineage'
+        ? state.points.filter((point) => {
+            if (!point.cluster) {
+              return true
+            }
+            return state.clusterVisibility[point.cluster] ?? true
+          })
+        : state.points,
+    [mode, state.clusterVisibility, state.points]
   )
   const fit = useMemo(() => fitView(visibleBasePoints), [visibleBasePoints])
   const flipCenter = fit.target
@@ -189,7 +194,7 @@ export default function UmapCanvas() {
   const pointLayer = useMemo(
     () =>
       new ScatterplotLayer({
-        id: 'umap-points',
+        id: `${mode}-umap-points`,
         data: displayPoints as unknown[],
         getPosition: (point: any) => point.displayPosition ?? [point.x, point.y],
         getRadius: () => state.pointSize,
@@ -198,6 +203,13 @@ export default function UmapCanvas() {
         pickable: true,
         opacity: state.pointOpacity,
         getFillColor: (point: any) => {
+          if (mode === 'global' && state.globalHighlight) {
+            if (point.is_highlighted) {
+              const [r, g, b] = colorForKey(state.globalHighlight.sourceClusterId, state.paletteName)
+              return [r, g, b, 255]
+            }
+            return [178, 182, 188, 110]
+          }
           if (state.colorMode === 'gene') {
             const value = Math.max(0, point.gene_expression ?? 0)
             const capped = Math.min(1, value / 4)
@@ -212,13 +224,23 @@ export default function UmapCanvas() {
         },
         updateTriggers: {
           getPosition: [state.flipHorizontal, state.flipVertical, flipCenter[0], flipCenter[1]],
-          getFillColor: [state.colorMode, state.paletteName, state.pointOpacity, state.geneColorGene]
+          getFillColor: [
+            mode,
+            state.colorMode,
+            state.globalHighlight?.sourceClusterId,
+            state.paletteName,
+            state.pointOpacity,
+            state.geneColorGene
+          ]
         }
       }),
     [
       displayPoints,
+      flipCenter,
+      mode,
       state.colorMode,
       state.geneColorGene,
+      state.globalHighlight,
       state.paletteName,
       state.pointOpacity,
       state.pointSize
@@ -228,7 +250,7 @@ export default function UmapCanvas() {
   const polygonLayer = useMemo(
     () =>
       new PolygonLayer({
-        id: 'saved-polygons',
+        id: `${mode}-saved-polygons`,
         data: displayPolygons as unknown[],
         pickable: false,
         filled: false,
@@ -241,7 +263,7 @@ export default function UmapCanvas() {
         getPolygon: (polygon: any) => polygon.displayVertices,
         getLineColor: (polygon: any) => polygonColor(polygon, state.paletteName)
       }),
-    [displayPolygons, state.paletteName, state.polygonStrokeWidth]
+    [displayPolygons, mode, state.paletteName, state.polygonStrokeWidth]
   )
 
   const viewport = useMemo(
@@ -274,119 +296,139 @@ export default function UmapCanvas() {
           <button className="button button-secondary" onClick={() => setViewState(fit)}>
             Reset view
           </button>
-          <button className="button" onClick={state.isDrawing ? state.stopDrawing : state.startDrawing}>
-            {state.isDrawing ? 'Stop drawing' : 'Draw polygon'}
-          </button>
-          <button
-            className="button"
-            onClick={() => void state.finalizeDraftPolygon()}
-            disabled={state.draftVertices.length < 3}
-          >
-            Close polygon
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={state.undoDraftVertex}
-            disabled={state.draftVertices.length === 0}
-          >
-            Undo point
-          </button>
-          <button className="button button-secondary" onClick={state.clearDraftPolygon}>
-            Clear draft
-          </button>
-          <button className="button button-secondary" onClick={state.clearPolygons}>
-            Clear all
-          </button>
+          {mode === 'lineage' ? (
+            <>
+              <button className="button" onClick={state.isDrawing ? state.stopDrawing : state.startDrawing}>
+                {state.isDrawing ? 'Stop drawing' : 'Draw polygon'}
+              </button>
+              <button
+                className="button"
+                onClick={() => void state.finalizeDraftPolygon()}
+                disabled={state.draftVertices.length < 3}
+              >
+                Close polygon
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={state.undoDraftVertex}
+                disabled={state.draftVertices.length === 0}
+              >
+                Undo point
+              </button>
+              <button className="button button-secondary" onClick={state.clearDraftPolygon}>
+                Clear draft
+              </button>
+              <button className="button button-secondary" onClick={state.clearPolygons}>
+                Clear all
+              </button>
+            </>
+          ) : null}
         </div>
         <div className="muted">
-          Displayed points: {visibleBasePoints.length}
-          {state.isDrawing ? ` | Draft points: ${state.draftVertices.length}` : ''}
-          {state.propagationResult ? ` | Propagated cells: ${state.propagationResult.n_assigned_cells}` : ''}
-          {state.colorMode === 'gene' && state.geneColorGene ? ` | Gene: ${state.geneColorGene}` : ''}
+          {mode === 'lineage' ? (
+            <>
+              Displayed points: {visibleBasePoints.length}
+              {state.isDrawing ? ` | Draft points: ${state.draftVertices.length}` : ''}
+              {state.propagationResult ? ` | Propagated cells: ${state.propagationResult.n_assigned_cells}` : ''}
+              {state.colorMode === 'gene' && state.geneColorGene ? ` | Gene: ${state.geneColorGene}` : ''}
+            </>
+          ) : (
+            <>
+              Displayed global points: {visibleBasePoints.length}
+              {state.globalHighlight
+                ? ` | Highlight: ${state.globalHighlight.sourceClusterName} (${state.globalHighlight.highlightedDisplayed}/${state.globalHighlight.highlightedTotal} shown)`
+                : ' | Standard cluster colors'}
+            </>
+          )}
         </div>
       </div>
       <div className="canvas-frame">
         <div ref={frameRef} className="canvas-stage">
-        <DeckGL
-          layers={[pointLayer, polygonLayer]}
-          views={[umapView]}
-          controller={!state.isDrawing}
-          viewState={viewState}
-          onViewStateChange={({ viewState: nextViewState }: any) => {
-            setViewState({
-              target: nextViewState.target,
-              zoom: nextViewState.zoom
-            })
-          }}
-          getTooltip={(info: any) => {
-            const object = info.object as RenderPoint | undefined
-            return object
-              ? {
-                  text: [
-                    `cell_id: ${object.cell_id}`,
-                    `cluster: ${object.cluster}`,
-                    `annotation: ${object.annotationLabel}`,
-                    state.colorMode === 'gene' && state.geneColorGene
-                      ? `${state.geneColorGene}: ${(object.gene_expression ?? 0).toFixed(3)}`
-                      : '',
-                    object.sample_id ? `sample_id: ${object.sample_id}` : '',
-                    object.region ? `region: ${object.region}` : ''
-                  ]
-                    .filter(Boolean)
-                    .join('\n')
+          <DeckGL
+            layers={mode === 'lineage' ? [pointLayer, polygonLayer] : [pointLayer]}
+            views={[umapView]}
+            controller={mode === 'lineage' ? !state.isDrawing : true}
+            viewState={viewState}
+            onViewStateChange={({ viewState: nextViewState }: any) => {
+              setViewState({
+                target: nextViewState.target,
+                zoom: nextViewState.zoom
+              })
+            }}
+            getTooltip={(info: any) => {
+              const object = info.object as RenderPoint | undefined
+              return object
+                ? {
+                    text: [
+                      `cell_id: ${object.cell_id}`,
+                      `cluster: ${object.cluster}`,
+                      `annotation: ${object.annotationLabel}`,
+                      mode === 'global' && state.globalHighlight
+                        ? `highlighted: ${object.is_highlighted ? 'yes' : 'no'}`
+                        : '',
+                      state.colorMode === 'gene' && state.geneColorGene
+                        ? `${state.geneColorGene}: ${(object.gene_expression ?? 0).toFixed(3)}`
+                        : '',
+                      object.sample_id ? `sample_id: ${object.sample_id}` : '',
+                      object.region ? `region: ${object.region}` : ''
+                    ]
+                      .filter(Boolean)
+                      .join('\n')
+                  }
+                : null
+            }}
+          />
+          {mode === 'lineage' ? (
+            <svg
+              className={`polygon-overlay ${state.isDrawing ? 'is-active' : ''}`}
+              viewBox={`0 0 ${frameSize.width} ${frameSize.height}`}
+              preserveAspectRatio="none"
+              onClick={(event) => {
+                if (!state.isDrawing) {
+                  return
                 }
-              : null
-          }}
-        />
-        <svg
-          className={`polygon-overlay ${state.isDrawing ? 'is-active' : ''}`}
-          viewBox={`0 0 ${frameSize.width} ${frameSize.height}`}
-          preserveAspectRatio="none"
-          onClick={(event) => {
-            if (!state.isDrawing) {
-              return
-            }
-            const rect = event.currentTarget.getBoundingClientRect()
-            const x = event.clientX - rect.left
-            const y = event.clientY - rect.top
-            const clickedVertex = viewport.unproject([x, y]) as number[]
-            const nextVertex = transformVertex(
-              clickedVertex,
-              flipCenter,
-              state.flipHorizontal,
-              state.flipVertical
-            )
-            state.addDraftVertex([Number(nextVertex[0]), Number(nextVertex[1])])
-          }}
-          onDoubleClick={() => {
-            if (state.isDrawing && state.draftVertices.length >= 3) {
-              void state.finalizeDraftPolygon()
-            }
-          }}
-        >
-          {draftScreenVertices.length > 0 ? (
-            <>
-              <polyline
-                points={draftScreenVertices.map((vertex) => `${vertex[0]},${vertex[1]}`).join(' ')}
-                fill="none"
-                stroke="#182126"
-                strokeWidth={String(Math.max(1, state.polygonStrokeWidth))}
-                strokeDasharray="6 4"
-              />
-              {draftScreenVertices.map((vertex, index) => (
-                <circle
-                  key={`${vertex[0]}_${vertex[1]}_${index}`}
-                  cx={vertex[0]}
-                  cy={vertex[1]}
-                  r="4"
-                  fill="#fffdfa"
-                  stroke="#182126"
-                  strokeWidth={String(Math.max(1, state.polygonStrokeWidth))}
-                />
-              ))}
-            </>
+                const rect = event.currentTarget.getBoundingClientRect()
+                const x = event.clientX - rect.left
+                const y = event.clientY - rect.top
+                const clickedVertex = viewport.unproject([x, y]) as number[]
+                const nextVertex = transformVertex(
+                  clickedVertex,
+                  flipCenter,
+                  state.flipHorizontal,
+                  state.flipVertical
+                )
+                state.addDraftVertex([Number(nextVertex[0]), Number(nextVertex[1])])
+              }}
+              onDoubleClick={() => {
+                if (state.isDrawing && state.draftVertices.length >= 3) {
+                  void state.finalizeDraftPolygon()
+                }
+              }}
+            >
+              {draftScreenVertices.length > 0 ? (
+                <>
+                  <polyline
+                    points={draftScreenVertices.map((vertex) => `${vertex[0]},${vertex[1]}`).join(' ')}
+                    fill="none"
+                    stroke="#182126"
+                    strokeWidth={String(Math.max(1, state.polygonStrokeWidth))}
+                    strokeDasharray="6 4"
+                  />
+                  {draftScreenVertices.map((vertex, index) => (
+                    <circle
+                      key={`${vertex[0]}_${vertex[1]}_${index}`}
+                      cx={vertex[0]}
+                      cy={vertex[1]}
+                      r="4"
+                      fill="#fffdfa"
+                      stroke="#182126"
+                      strokeWidth={String(Math.max(1, state.polygonStrokeWidth))}
+                    />
+                  ))}
+                </>
+              ) : null}
+            </svg>
           ) : null}
-        </svg>
         </div>
       </div>
     </section>

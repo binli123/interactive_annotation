@@ -19,9 +19,15 @@ from app.schemas.api import (
     GeneCatalogResponse,
     GeneExpressionRequest,
     GeneExpressionResponse,
+    HighlightGlobalRequest,
     MarkerDiscoveryRequest,
     MarkerDiscoveryResponse,
     MetadataResponse,
+    MoveClusterRequest,
+    MoveClusterPreviewResponse,
+    MoveClusterResponse,
+    MoveClusterUndoResponse,
+    MoveClusterUndoStatusResponse,
     ObjectCard,
     PointClusterRequest,
     PointClusterResponse,
@@ -90,6 +96,17 @@ def _resolve_record(object_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _global_record():
+    try:
+        return registry.build_record(
+            object_path=settings.default_global_object_path,
+            lineage_name="Global",
+            lineage_dir=settings.default_global_object_path.parent,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 def _string_series(values, index) -> pd.Series:
     return pd.Series(np.asarray(values, dtype=object), index=index, dtype=object)
 
@@ -114,7 +131,12 @@ def _validate_saved_h5ad(path: Path) -> None:
 
 @router.post("/scan-folder", response_model=list[ObjectCard])
 def scan_folder(request: ScanFolderRequest) -> list[ObjectCard]:
-    folder = Path(request.folder_path).expanduser() if request.folder_path else settings.default_lineage_root
+    fallback_folder = settings.default_lineage_root
+    requested_folder = Path(request.folder_path).expanduser() if request.folder_path else None
+    if requested_folder and not requested_folder.exists() and str(requested_folder) == "/data/lineages_current":
+        folder = fallback_folder
+    else:
+        folder = requested_folder or fallback_folder
     try:
         records = registry.scan(folder)
     except FileNotFoundError as exc:
@@ -142,6 +164,57 @@ def object_genes(object_id: str) -> GeneCatalogResponse:
     return GeneCatalogResponse(**adata_service.get_gene_catalog(record))
 
 
+@router.get("/global/metadata", response_model=MetadataResponse)
+def global_metadata() -> MetadataResponse:
+    record = _global_record()
+    try:
+        return MetadataResponse(**adata_service.get_metadata(record))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/global/umap", response_model=UmapResponse)
+def global_umap(request: UmapRequest) -> UmapResponse:
+    record = _global_record()
+    try:
+        payload = adata_service.get_umap_points(
+            record=record,
+            embedding_key=request.embedding_key,
+            cluster_key=request.cluster_key,
+            gene_name=request.gene_name,
+            max_points=request.max_points,
+            min_per_cluster=request.min_per_cluster,
+            random_seed=request.random_seed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UmapResponse(**payload)
+
+
+@router.post("/global/highlight-from-object", response_model=UmapResponse)
+def global_highlight_from_object(request: HighlightGlobalRequest) -> UmapResponse:
+    source_record = _resolve_record(request.source_object_id)
+    global_record = _global_record()
+    try:
+        highlight_cell_ids = adata_service.get_cluster_cell_ids(
+            record=source_record,
+            cluster_key=request.source_cluster_key,
+            cluster_id=request.source_cluster_id,
+        )
+        payload = adata_service.get_umap_points_with_highlight(
+            record=global_record,
+            embedding_key=request.embedding_key,
+            cluster_key=request.cluster_key,
+            highlight_cell_ids=highlight_cell_ids,
+            max_points=request.max_points,
+            min_per_cluster=request.min_per_cluster,
+            random_seed=request.random_seed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UmapResponse(**payload)
+
+
 @router.post("/objects/{object_id}/gene-expression", response_model=GeneExpressionResponse)
 def object_gene_expression(object_id: str, request: GeneExpressionRequest) -> GeneExpressionResponse:
     record = _resolve_record(object_id)
@@ -155,6 +228,16 @@ def object_gene_expression(object_id: str, request: GeneExpressionRequest) -> Ge
 @router.post("/objects/{object_id}/point-clusters", response_model=PointClusterResponse)
 def object_point_clusters(object_id: str, request: PointClusterRequest) -> PointClusterResponse:
     record = _resolve_record(object_id)
+    try:
+        payload = adata_service.get_point_cluster_values(record, request.cluster_key, request.indices)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PointClusterResponse(**payload)
+
+
+@router.post("/global/point-clusters", response_model=PointClusterResponse)
+def global_point_clusters(request: PointClusterRequest) -> PointClusterResponse:
+    record = _global_record()
     try:
         payload = adata_service.get_point_cluster_values(record, request.cluster_key, request.indices)
     except ValueError as exc:
@@ -619,3 +702,52 @@ def save_session(object_id: str, request: SaveRequest) -> SaveResponse:
         polygons_geojson_path=str(polygons_geojson_path),
         summary_csv_path=str(summary_csv_path),
     )
+
+
+@router.post("/objects/{object_id}/move-cluster-preview", response_model=MoveClusterPreviewResponse)
+def move_cluster_preview(object_id: str, request: MoveClusterRequest) -> MoveClusterPreviewResponse:
+    source_record = _resolve_record(object_id)
+    destination_record = _resolve_record(request.destination_object_id)
+    try:
+        payload = adata_service.preview_move_cluster_between_objects(
+            source_record=source_record,
+            destination_record=destination_record,
+            cluster_key=request.cluster_key,
+            cluster_id=request.cluster_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return MoveClusterPreviewResponse(**payload)
+
+
+@router.post("/objects/{object_id}/move-cluster", response_model=MoveClusterResponse)
+def move_cluster(object_id: str, request: MoveClusterRequest) -> MoveClusterResponse:
+    source_record = _resolve_record(object_id)
+    destination_record = _resolve_record(request.destination_object_id)
+    try:
+        payload = adata_service.move_cluster_between_objects(
+            source_record=source_record,
+            destination_record=destination_record,
+            cluster_key=request.cluster_key,
+            cluster_id=request.cluster_id,
+            allow_overwrite=request.allow_overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    registry.scan(registry.scan_root or settings.default_lineage_root)
+    return MoveClusterResponse(**payload)
+
+
+@router.get("/move-cluster-undo", response_model=MoveClusterUndoStatusResponse)
+def move_cluster_undo_status() -> MoveClusterUndoStatusResponse:
+    return MoveClusterUndoStatusResponse(**adata_service.get_latest_move_status())
+
+
+@router.post("/move-cluster-undo", response_model=MoveClusterUndoResponse)
+def undo_move_cluster() -> MoveClusterUndoResponse:
+    try:
+        payload = adata_service.undo_latest_move()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    registry.scan(registry.scan_root or settings.default_lineage_root)
+    return MoveClusterUndoResponse(**payload)

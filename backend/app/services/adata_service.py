@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
+import re
+import shutil
 from collections import OrderedDict
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -19,7 +23,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from app.core.config import settings
 from app.models.state import ObjectRecord
 from app.services.polygon_ops import points_in_polygon
-from app.services.sampling import stratified_sample_indices
+from app.services.registry import registry
+from app.services.sampling import priority_stratified_sample_indices, stratified_sample_indices
 
 
 def _obs_to_str_array(frame: pd.DataFrame, column: str, default: str = "") -> np.ndarray:
@@ -49,6 +54,101 @@ def _sanitize_suffix(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value.strip().lower())
     cleaned = "_".join(part for part in cleaned.split("_") if part)
     return cleaned or "new"
+
+
+def _next_available_cluster_id(existing_ids: list[str], requested_id: str) -> str:
+    existing = {str(value) for value in existing_ids}
+    numeric_values = []
+    for value in existing:
+        if re.fullmatch(r"-?\d+", value):
+            numeric_values.append(int(value))
+
+    if numeric_values:
+        candidate = max(numeric_values) + 1
+        while str(candidate) in existing:
+            candidate += 1
+        return str(candidate)
+
+    if requested_id not in existing:
+        return requested_id
+
+    suffix = 1
+    candidate = f"{requested_id}_moved_{suffix}"
+    while candidate in existing:
+        suffix += 1
+        candidate = f"{requested_id}_moved_{suffix}"
+    return candidate
+
+
+def _coerce_series_for_union(frame: pd.DataFrame, column: str) -> pd.Series:
+    series = frame[column]
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype("boolean")
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    return series.astype("string")
+
+
+def _strip_origin_suffix(value: str) -> str:
+    return re.sub(r"\s+\(from .+\)$", "", value).strip()
+
+
+def _normalize_series_for_write(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype("boolean")
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    non_null = series.dropna()
+    if not non_null.empty:
+        numeric_probe = pd.to_numeric(non_null.astype(str), errors="coerce")
+        if not numeric_probe.isna().any():
+            numeric_full = pd.to_numeric(series.astype("string"), errors="coerce")
+            if (numeric_probe % 1 == 0).all():
+                return numeric_full.astype("Int64")
+            return numeric_full.astype(float)
+
+    return series.astype("string")
+
+
+def _normalize_obs_for_write(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    for column in normalized.columns:
+        normalized[column] = _normalize_series_for_write(normalized[column])
+    return normalized
+
+
+def _python_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return bool(_python_scalar(value))
+
+
+def _unique_obs_names(incoming_names: pd.Index, existing_names: pd.Index) -> pd.Index:
+    used = {str(value) for value in existing_names.tolist()}
+    assigned: list[str] = []
+    for raw_name in incoming_names.tolist():
+        base = str(raw_name)
+        candidate = base
+        suffix = 1
+        while candidate in used:
+            candidate = f"{base}_moved_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        assigned.append(candidate)
+    return pd.Index(assigned)
 
 
 def _write_safe_plot_env() -> dict[str, Path]:
@@ -158,6 +258,266 @@ class AnnDataService:
             ) from exc
         return self._touch(record.object_id, adata)
 
+    def invalidate_cached(self, object_id: str) -> None:
+        cached = self._cache.pop(object_id, None)
+        if cached is not None and getattr(cached, "isbacked", False):
+            cached.file.close()
+
+    def _move_undo_dir(self) -> Path:
+        path = settings.project_root / ".move_undo"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _move_undo_metadata_path(self) -> Path:
+        return self._move_undo_dir() / "latest_move.json"
+
+    def _move_undo_source_path(self) -> Path:
+        return self._move_undo_dir() / "latest_source_before_move.h5ad"
+
+    def _move_undo_destination_path(self) -> Path:
+        return self._move_undo_dir() / "latest_destination_before_move.h5ad"
+
+    def _clear_latest_move_snapshot(self) -> None:
+        for path in (
+            self._move_undo_metadata_path(),
+            self._move_undo_source_path(),
+            self._move_undo_destination_path(),
+        ):
+            path.unlink(missing_ok=True)
+
+    def _latest_move_status_payload(self) -> dict[str, Any]:
+        metadata_path = self._move_undo_metadata_path()
+        if not metadata_path.exists():
+            return {"available": False}
+        try:
+            payload = json.loads(metadata_path.read_text())
+        except Exception:
+            self._clear_latest_move_snapshot()
+            return {"available": False}
+
+        source_snapshot_path = Path(payload.get("source_snapshot_path", ""))
+        destination_snapshot_path = Path(payload.get("destination_snapshot_path", ""))
+        if not source_snapshot_path.exists() or not destination_snapshot_path.exists():
+            self._clear_latest_move_snapshot()
+            return {"available": False}
+
+        return {"available": True, **payload}
+
+    def get_latest_move_status(self) -> dict[str, Any]:
+        return self._latest_move_status_payload()
+
+    def _record_latest_move_snapshot(
+        self,
+        *,
+        source_record: ObjectRecord,
+        destination_record: ObjectRecord,
+        preview: dict[str, Any],
+    ) -> None:
+        self._clear_latest_move_snapshot()
+        source_snapshot_path = self._move_undo_source_path()
+        destination_snapshot_path = self._move_undo_destination_path()
+        shutil.copy2(source_record.object_path, source_snapshot_path)
+        try:
+            shutil.copy2(destination_record.object_path, destination_snapshot_path)
+        except Exception:
+            source_snapshot_path.unlink(missing_ok=True)
+            raise
+
+        payload = {
+            "source_object_id": source_record.object_id,
+            "source_object_path": str(source_record.object_path),
+            "source_lineage_name": source_record.lineage_name,
+            "destination_object_id": destination_record.object_id,
+            "destination_object_path": str(destination_record.object_path),
+            "destination_lineage_name": destination_record.lineage_name,
+            "cluster_key": str(preview["cluster_key"]),
+            "source_cluster_id": str(preview["source_cluster_id"]),
+            "assigned_cluster_id": str(preview["assigned_cluster_id"]),
+            "display_name": str(preview["display_name"]),
+            "n_moved_cells": int(preview["n_moved_cells"]),
+            "n_overwritten_cells": int(preview["n_overwritten_cells"]),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_snapshot_path": str(source_snapshot_path),
+            "destination_snapshot_path": str(destination_snapshot_path),
+        }
+        self._move_undo_metadata_path().write_text(json.dumps(payload, indent=2))
+
+    def undo_latest_move(self) -> dict[str, Any]:
+        payload = self._latest_move_status_payload()
+        if not payload.get("available"):
+            raise ValueError("No move snapshot is available to undo.")
+
+        source_record = registry.build_record(
+            object_path=Path(str(payload["source_object_path"])),
+            lineage_name=str(payload.get("source_lineage_name") or Path(str(payload["source_object_path"])).stem),
+            lineage_dir=Path(str(payload["source_object_path"])).parent,
+        )
+        destination_record = registry.build_record(
+            object_path=Path(str(payload["destination_object_path"])),
+            lineage_name=str(payload.get("destination_lineage_name") or Path(str(payload["destination_object_path"])).stem),
+            lineage_dir=Path(str(payload["destination_object_path"])).parent,
+        )
+
+        source_snapshot_path = Path(str(payload["source_snapshot_path"]))
+        destination_snapshot_path = Path(str(payload["destination_snapshot_path"]))
+        if not source_snapshot_path.exists() or not destination_snapshot_path.exists():
+            self._clear_latest_move_snapshot()
+            raise ValueError("The saved move snapshot is incomplete and cannot be restored.")
+
+        source_restore_path = source_record.object_path.with_suffix(source_record.object_path.suffix + ".undo_restore")
+        destination_restore_path = destination_record.object_path.with_suffix(destination_record.object_path.suffix + ".undo_restore")
+        shutil.copy2(source_snapshot_path, source_restore_path)
+        try:
+            shutil.copy2(destination_snapshot_path, destination_restore_path)
+        except Exception:
+            source_restore_path.unlink(missing_ok=True)
+            raise
+
+        try:
+            source_restore_path.replace(source_record.object_path)
+            destination_restore_path.replace(destination_record.object_path)
+        except Exception:
+            source_restore_path.unlink(missing_ok=True)
+            destination_restore_path.unlink(missing_ok=True)
+            raise
+
+        self.invalidate_cached(source_record.object_id)
+        self.invalidate_cached(destination_record.object_id)
+        self._clear_latest_move_snapshot()
+
+        return {
+            "available": False,
+            "restored": True,
+            "source_object_id": source_record.object_id,
+            "source_object_path": str(source_record.object_path),
+            "destination_object_id": destination_record.object_id,
+            "destination_object_path": str(destination_record.object_path),
+            "cluster_key": str(payload["cluster_key"]),
+            "source_cluster_id": str(payload["source_cluster_id"]),
+            "assigned_cluster_id": str(payload["assigned_cluster_id"]),
+            "display_name": str(payload["display_name"]),
+            "n_moved_cells": int(payload["n_moved_cells"]),
+            "n_overwritten_cells": int(payload["n_overwritten_cells"]),
+            "created_at": str(payload["created_at"]),
+        }
+
+    def _embedding_recompute_config(self, adata: ad.AnnData) -> dict[str, Any]:
+        script_info = {
+            str(key): _python_scalar(value)
+            for key, value in dict(adata.uns.get("recomputed_umap_all_genes", {})).items()
+        }
+        neighbors_params = {
+            str(key): _python_scalar(value)
+            for key, value in dict(adata.uns.get("neighbors", {}).get("params", {})).items()
+        }
+        pca_params = {
+            str(key): _python_scalar(value)
+            for key, value in dict(adata.uns.get("pca", {}).get("params", {})).items()
+        }
+        umap_params = {
+            str(key): _python_scalar(value)
+            for key, value in dict(adata.uns.get("umap", {}).get("params", {})).items()
+        }
+
+        n_obs = int(adata.n_obs)
+        n_vars = int(adata.n_vars)
+        max_components = max(2, min(50, n_obs - 1, n_vars))
+        configured_pcs = int(script_info.get("n_pcs") or neighbors_params.get("n_pcs") or 50)
+        n_pcs = max(2, min(configured_pcs, max_components))
+        configured_neighbors = int(script_info.get("n_neighbors") or neighbors_params.get("n_neighbors") or settings.default_neighbors)
+        n_neighbors = max(2, min(configured_neighbors, max(2, n_obs - 1)))
+
+        x_sample = adata.X[: min(n_obs, 2048)]
+        if sparse.issparse(x_sample):
+            nonzero = x_sample.data
+        else:
+            x_array = np.asarray(x_sample)
+            nonzero = x_array[x_array > 0]
+        max_nonzero = float(nonzero.max()) if nonzero.size else 0.0
+        non_integer_fraction = (
+            float(np.mean(~np.isclose(nonzero, np.round(nonzero)))) if nonzero.size else 0.0
+        )
+        looks_logged = max_nonzero <= 25.0 and non_integer_fraction > 0.05
+
+        return {
+            "n_pcs": n_pcs,
+            "n_neighbors": n_neighbors,
+            "metric": str(script_info.get("metric") or neighbors_params.get("metric") or "cosine"),
+            "random_state": int(script_info.get("random_state") or neighbors_params.get("random_state") or 0),
+            "min_dist": float(script_info.get("min_dist") or umap_params.get("min_dist") or 0.3),
+            "spread": float(script_info.get("spread") or umap_params.get("spread") or 1.0),
+            "zero_center": _bool_value(pca_params.get("zero_center"), default=False),
+            "use_highly_variable": _bool_value(pca_params.get("use_highly_variable"), default=False),
+            "normalize_first": _bool_value(script_info.get("normalized_in_script"), default=not looks_logged),
+            "log1p_first": _bool_value(script_info.get("log1p_in_script"), default=not looks_logged),
+            "input_already_logged": _bool_value(script_info.get("input_already_logged"), default=looks_logged),
+            "max_nonzero": max_nonzero,
+            "non_integer_fraction": non_integer_fraction,
+        }
+
+    def recompute_embeddings(self, adata: ad.AnnData, context_label: str) -> ad.AnnData:
+        if adata.n_obs == 0:
+            raise ValueError(f"Cannot recompute embeddings for empty object: {context_label}")
+
+        config = self._embedding_recompute_config(adata)
+        if adata.n_obs < 3 or adata.n_vars < 2:
+            x_pca = np.zeros((adata.n_obs, min(2, max(1, adata.n_vars))), dtype=np.float32)
+            x_umap = np.zeros((adata.n_obs, 2), dtype=np.float32)
+            adata.obsm["X_pca"] = x_pca
+            adata.obsm["X_umap"] = x_umap
+            adata.uns["neighbors"] = {"params": {"method": "insufficient_cells"}}
+            adata.uns["pca"] = {"params": {"zero_center": False}}
+            adata.uns["umap"] = {"params": {"min_dist": 0.0}}
+            adata.obsp.clear()
+            return adata
+
+        env_paths = _write_safe_plot_env()
+        import numba
+
+        numba.config.CACHE_DIR = str(env_paths["numba_cache"])
+        import scanpy as sc
+
+        if config["normalize_first"] and not config["input_already_logged"]:
+            sc.pp.normalize_total(adata, target_sum=1e4)
+        if config["log1p_first"] and not config["input_already_logged"]:
+            sc.pp.log1p(adata)
+
+        sc.pp.pca(
+            adata,
+            n_comps=int(config["n_pcs"]),
+            zero_center=bool(config["zero_center"]),
+            use_highly_variable=bool(config["use_highly_variable"]),
+        )
+        sc.pp.neighbors(
+            adata,
+            n_neighbors=int(config["n_neighbors"]),
+            n_pcs=int(config["n_pcs"]),
+            use_rep="X_pca",
+            metric=str(config["metric"]),
+        )
+        sc.tl.umap(
+            adata,
+            min_dist=float(config["min_dist"]),
+            spread=float(config["spread"]),
+            random_state=int(config["random_state"]),
+        )
+
+        adata.uns["move_cluster_recompute"] = {
+            "context_label": context_label,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "n_neighbors": int(config["n_neighbors"]),
+            "n_pcs": int(config["n_pcs"]),
+            "metric": str(config["metric"]),
+            "min_dist": float(config["min_dist"]),
+            "spread": float(config["spread"]),
+            "normalize_first": bool(config["normalize_first"] and not config["input_already_logged"]),
+            "log1p_first": bool(config["log1p_first"] and not config["input_already_logged"]),
+            "input_already_logged": bool(config["input_already_logged"]),
+            "matrix_check_max_nonzero": float(config["max_nonzero"]),
+            "matrix_check_frac_non_integer": float(config["non_integer_fraction"]),
+        }
+        return adata
+
     def get_metadata(self, record: ObjectRecord) -> dict[str, Any]:
         adata = self.get_adata(record)
         embedding_keys = sorted(list(adata.obsm.keys()))
@@ -195,29 +555,16 @@ class AnnDataService:
             "manifest": record.manifest,
         }
 
-    def get_umap_points(
+    def _point_payload(
         self,
+        adata: ad.AnnData,
         record: ObjectRecord,
-        embedding_key: str,
-        cluster_key: str | None,
+        indices: np.ndarray,
+        coords: np.ndarray,
+        clusters: np.ndarray,
         gene_name: str | None,
-        max_points: int,
-        min_per_cluster: int,
-        random_seed: int,
+        highlight_mask: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
-        clusters = (
-            _obs_to_str_array(adata.obs, cluster_key, default="all")
-            if cluster_key
-            else np.full(adata.n_obs, "all", dtype=object)
-        )
-        indices = stratified_sample_indices(
-            labels=clusters.astype(str),
-            max_points=max_points,
-            min_per_cluster=min_per_cluster,
-            random_seed=random_seed,
-        )
         obs_frame = adata.obs.iloc[indices]
         if "cell_id" in adata.obs.columns:
             cell_ids = _obs_to_str_array(adata.obs, "cell_id")[indices]
@@ -254,31 +601,125 @@ class AnnDataService:
 
         points = []
         for local_pos, obs_index in enumerate(indices.tolist()):
-            points.append(
-                {
-                    "index": int(obs_index),
-                    "obs_name": str(adata.obs_names[obs_index]),
-                    "cell_id": str(cell_ids[local_pos]),
-                    "x": float(coords[obs_index, 0]),
-                    "y": float(coords[obs_index, 1]),
-                    "cluster": str(clusters[obs_index]),
-                    "sample_id": str(obs_frame.iloc[local_pos]["sample_id"]) if "sample_id" in obs_frame.columns else None,
-                    "region": str(obs_frame.iloc[local_pos]["region"]) if "region" in obs_frame.columns else None,
-                    "lineage": str(obs_frame.iloc[local_pos]["lineage"]) if "lineage" in obs_frame.columns else None,
-                    "current_label": str(current_label[local_pos]) if current_label[local_pos] else None,
-                    "current_score": None if np.isnan(current_score[local_pos]) else float(current_score[local_pos]),
-                    "gene_expression": None if np.isnan(gene_expression[local_pos]) else float(gene_expression[local_pos]),
-                }
-            )
+            point = {
+                "index": int(obs_index),
+                "obs_name": str(adata.obs_names[obs_index]),
+                "cell_id": str(cell_ids[local_pos]),
+                "x": float(coords[obs_index, 0]),
+                "y": float(coords[obs_index, 1]),
+                "cluster": str(clusters[obs_index]),
+                "sample_id": str(obs_frame.iloc[local_pos]["sample_id"]) if "sample_id" in obs_frame.columns else None,
+                "region": str(obs_frame.iloc[local_pos]["region"]) if "region" in obs_frame.columns else None,
+                "lineage": str(obs_frame.iloc[local_pos]["lineage"]) if "lineage" in obs_frame.columns else None,
+                "current_label": str(current_label[local_pos]) if current_label[local_pos] else None,
+                "current_score": None if np.isnan(current_score[local_pos]) else float(current_score[local_pos]),
+                "gene_expression": None if np.isnan(gene_expression[local_pos]) else float(gene_expression[local_pos]),
+            }
+            if highlight_mask is not None:
+                point["is_highlighted"] = bool(highlight_mask[obs_index])
+            points.append(point)
+
+        response: dict[str, Any] = {
+            "object_id": record.object_id,
+            "points": points,
+        }
+        if highlight_mask is not None:
+            displayed_highlight = highlight_mask[indices]
+            response["highlighted_total"] = int(highlight_mask.sum())
+            response["highlighted_displayed"] = int(displayed_highlight.sum())
+        return response
+
+    def get_umap_points(
+        self,
+        record: ObjectRecord,
+        embedding_key: str,
+        cluster_key: str | None,
+        gene_name: str | None,
+        max_points: int,
+        min_per_cluster: int,
+        random_seed: int,
+    ) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
+        clusters = (
+            _obs_to_str_array(adata.obs, cluster_key, default="all")
+            if cluster_key
+            else np.full(adata.n_obs, "all", dtype=object)
+        )
+        indices = stratified_sample_indices(
+            labels=clusters.astype(str),
+            max_points=max_points,
+            min_per_cluster=min_per_cluster,
+            random_seed=random_seed,
+        )
+        payload = self._point_payload(
+            adata=adata,
+            record=record,
+            indices=indices,
+            coords=coords,
+            clusters=clusters,
+            gene_name=gene_name,
+        )
 
         return {
-            "object_id": record.object_id,
+            **payload,
             "embedding_key": embedding_key,
             "cluster_key": cluster_key,
             "gene_name": gene_name,
             "total_cells": int(adata.n_obs),
             "displayed_cells": int(indices.size),
-            "points": points,
+            "points": payload["points"],
+        }
+
+    def get_umap_points_with_highlight(
+        self,
+        record: ObjectRecord,
+        embedding_key: str,
+        cluster_key: str | None,
+        highlight_cell_ids: set[str],
+        max_points: int,
+        min_per_cluster: int,
+        random_seed: int,
+    ) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
+        clusters = (
+            _obs_to_str_array(adata.obs, cluster_key, default="all")
+            if cluster_key
+            else np.full(adata.n_obs, "all", dtype=object)
+        )
+        cell_ids = (
+            _obs_to_str_array(adata.obs, "cell_id")
+            if "cell_id" in adata.obs.columns
+            else adata.obs_names.to_numpy(dtype=object)
+        )
+        highlight_mask = np.isin(cell_ids.astype(str), list(highlight_cell_ids))
+        indices = priority_stratified_sample_indices(
+            labels=clusters.astype(str),
+            priority_mask=highlight_mask,
+            max_points=max_points,
+            min_per_cluster=min_per_cluster,
+            random_seed=random_seed,
+        )
+        payload = self._point_payload(
+            adata=adata,
+            record=record,
+            indices=indices,
+            coords=coords,
+            clusters=clusters,
+            gene_name=None,
+            highlight_mask=highlight_mask,
+        )
+        return {
+            **payload,
+            "embedding_key": embedding_key,
+            "cluster_key": cluster_key,
+            "gene_name": None,
+            "total_cells": int(adata.n_obs),
+            "displayed_cells": int(indices.size),
+            "points": payload["points"],
+            "highlighted_total": payload["highlighted_total"],
+            "highlighted_displayed": payload["highlighted_displayed"],
         }
 
     def get_gene_catalog(self, record: ObjectRecord) -> dict[str, Any]:
@@ -612,6 +1053,252 @@ class AnnDataService:
             "candidate_genes": candidates,
         }
 
+    def get_cluster_cell_ids(
+        self,
+        record: ObjectRecord,
+        cluster_key: str,
+        cluster_id: str,
+    ) -> set[str]:
+        adata = self.get_adata(record)
+        if cluster_key not in adata.obs.columns:
+            raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+        cluster_values = _obs_to_str_array(adata.obs, cluster_key, default="NA")
+        mask = cluster_values.astype(str) == str(cluster_id)
+        if not bool(mask.any()):
+            raise ValueError(f"Cluster not found in {cluster_key}: {cluster_id}")
+        cell_ids = (
+            _obs_to_str_array(adata.obs, "cell_id")[mask]
+            if "cell_id" in adata.obs.columns
+            else adata.obs_names.to_numpy(dtype=object)[mask]
+        )
+        return {str(cell_id) for cell_id in cell_ids.tolist()}
+
+    def _prepare_concat_frames(self, source: ad.AnnData, dest: ad.AnnData) -> tuple[ad.AnnData, ad.AnnData]:
+        obs_columns = list(dict.fromkeys(list(dest.obs.columns) + list(source.obs.columns)))
+        for adata in (dest, source):
+            for column in obs_columns:
+                if column not in adata.obs.columns:
+                    adata.obs[column] = pd.Series(pd.NA, index=adata.obs.index, dtype="string")
+                adata.obs[column] = _coerce_series_for_union(adata.obs, column)
+            adata.obs = adata.obs[obs_columns].copy()
+
+        obsm_keys = sorted(set(dest.obsm.keys()) | set(source.obsm.keys()))
+        for key in obsm_keys:
+            if key in dest.obsm and key in source.obsm:
+                continue
+            reference = dest.obsm[key] if key in dest.obsm else source.obsm[key]
+            width = int(np.asarray(reference).shape[1])
+            if key not in dest.obsm:
+                dest.obsm[key] = np.full((dest.n_obs, width), np.nan, dtype=float)
+            if key not in source.obsm:
+                source.obsm[key] = np.full((source.n_obs, width), np.nan, dtype=float)
+
+        for adata in (dest, source):
+            for key in list(adata.obsp.keys()):
+                del adata.obsp[key]
+        return source, dest
+
+    def preview_move_cluster_between_objects(
+        self,
+        source_record: ObjectRecord,
+        destination_record: ObjectRecord,
+        cluster_key: str,
+        cluster_id: str,
+    ) -> dict[str, Any]:
+        if source_record.object_id == destination_record.object_id:
+            raise ValueError("Choose a different destination object.")
+
+        source = self.get_adata(source_record)
+        destination = self.get_adata(destination_record)
+
+        if cluster_key not in source.obs.columns:
+            raise ValueError(f"Cluster key not found in source object: {cluster_key}")
+        if cluster_key not in destination.obs.columns:
+            raise ValueError(
+                f"Destination object does not contain cluster key: {cluster_key}. "
+                "Select a destination that already has the same active cluster key."
+            )
+        if source.var_names.tolist() != destination.var_names.tolist():
+            raise ValueError("Source and destination objects do not share identical var_names.")
+
+        source_cluster_values = _obs_to_str_array(source.obs, cluster_key, default="NA")
+        move_mask = source_cluster_values.astype(str) == str(cluster_id)
+        n_moved = int(move_mask.sum())
+        if n_moved == 0:
+            raise ValueError(f"No cells found in source cluster: {cluster_id}")
+        if n_moved == source.n_obs:
+            raise ValueError("Refusing to move every cell out of the source object.")
+
+        destination_cluster_values = _obs_to_str_array(destination.obs, cluster_key, default="NA")
+        destination_cluster_ids = destination_cluster_values.astype(str).tolist()
+        assigned_cluster_id = (
+            _next_available_cluster_id(destination_cluster_ids, str(cluster_id))
+            if str(cluster_id) in set(destination_cluster_ids)
+            else str(cluster_id)
+        )
+
+        n_overwritten_cells = 0
+        if "cell_id" in source.obs.columns and "cell_id" in destination.obs.columns:
+            moving_cell_ids = set(_obs_to_str_array(source.obs, "cell_id")[move_mask].tolist())
+            destination_cell_ids = set(_obs_to_str_array(destination.obs, "cell_id").tolist())
+            n_overwritten_cells = int(len(moving_cell_ids & destination_cell_ids))
+
+        display_column = _display_column_name(cluster_key)
+        source_display_values = (
+            _obs_to_str_array(source.obs, display_column, default="")
+            if display_column in source.obs.columns
+            else source_cluster_values.copy()
+        )
+        source_display_name = next(
+            (
+                _strip_origin_suffix(str(value).strip())
+                for value in source_display_values[move_mask].tolist()
+                if str(value).strip()
+            ),
+            str(cluster_id),
+        )
+        moved_display_name = f"{source_display_name} (from {source_record.lineage_name})"
+
+        return {
+            "source_object_id": source_record.object_id,
+            "source_object_path": str(source_record.object_path),
+            "destination_object_id": destination_record.object_id,
+            "destination_object_path": str(destination_record.object_path),
+            "cluster_key": cluster_key,
+            "source_cluster_id": str(cluster_id),
+            "assigned_cluster_id": assigned_cluster_id,
+            "display_name": moved_display_name,
+            "n_moved_cells": n_moved,
+            "n_overwritten_cells": n_overwritten_cells,
+        }
+
+    def move_cluster_between_objects(
+        self,
+        source_record: ObjectRecord,
+        destination_record: ObjectRecord,
+        cluster_key: str,
+        cluster_id: str,
+        allow_overwrite: bool = False,
+    ) -> dict[str, Any]:
+        preview = self.preview_move_cluster_between_objects(
+            source_record=source_record,
+            destination_record=destination_record,
+            cluster_key=cluster_key,
+            cluster_id=cluster_id,
+        )
+        if preview["n_overwritten_cells"] > 0 and not allow_overwrite:
+            raise ValueError(
+                f"Destination object already contains {preview['n_overwritten_cells']} source cell_id values. "
+                "Request a move preview and confirm overwrite before applying the move."
+            )
+
+        source = self.get_adata(source_record).copy()
+        destination = self.get_adata(destination_record).copy()
+        source_cluster_values = _obs_to_str_array(source.obs, cluster_key, default="NA")
+        move_mask = source_cluster_values.astype(str) == str(cluster_id)
+        n_moved = int(preview["n_moved_cells"])
+        assigned_cluster_id = str(preview["assigned_cluster_id"])
+        moved_display_name = str(preview["display_name"])
+        display_column = _display_column_name(cluster_key)
+
+        if display_column not in destination.obs.columns:
+            destination.obs[display_column] = pd.Series(
+                _obs_to_str_array(destination.obs, cluster_key, default=""),
+                index=destination.obs_names,
+                dtype=object,
+            )
+
+        moving = source[move_mask].copy()
+        remaining = source[~move_mask].copy()
+        if preview["n_overwritten_cells"] > 0 and "cell_id" in moving.obs.columns and "cell_id" in destination.obs.columns:
+            moving_cell_ids = set(_obs_to_str_array(moving.obs, "cell_id").tolist())
+            destination_keep_mask = ~np.isin(_obs_to_str_array(destination.obs, "cell_id"), list(moving_cell_ids))
+            destination = destination[destination_keep_mask].copy()
+        moving.obs_names = _unique_obs_names(moving.obs_names, destination.obs_names)
+        moving.obs[cluster_key] = pd.Series(
+            np.repeat(assigned_cluster_id, moving.n_obs),
+            index=moving.obs_names,
+            dtype=object,
+        )
+        moving.obs[display_column] = pd.Series(
+            np.repeat(moved_display_name, moving.n_obs),
+            index=moving.obs_names,
+            dtype=object,
+        )
+        moving.obs["moved_from_object"] = pd.Series(
+            np.repeat(source_record.lineage_name, moving.n_obs),
+            index=moving.obs_names,
+            dtype=object,
+        )
+        moving.obs["moved_from_path"] = pd.Series(
+            np.repeat(str(source_record.object_path), moving.n_obs),
+            index=moving.obs_names,
+            dtype=object,
+        )
+
+        moving, destination = self._prepare_concat_frames(moving, destination)
+        combined = ad.concat([destination, moving], join="outer", merge="same", index_unique=None)
+        for adata in (combined, remaining):
+            for key in list(adata.obsp.keys()):
+                del adata.obsp[key]
+
+        combined.uns = deepcopy(destination.uns)
+        display_name_definitions = deepcopy(combined.uns.get("cluster_display_name_definitions", {}))
+        destination_mapping = dict(display_name_definitions.get(cluster_key, {}))
+        destination_mapping[assigned_cluster_id] = moved_display_name
+        display_name_definitions[str(cluster_key)] = destination_mapping
+        combined.uns["cluster_display_name_definitions"] = display_name_definitions
+        if cluster_key == "reannot_label":
+            combined.uns["reannotation_label_definitions"] = destination_mapping
+
+        self._record_latest_move_snapshot(
+            source_record=source_record,
+            destination_record=destination_record,
+            preview=preview,
+        )
+        remaining = self.recompute_embeddings(remaining, f"{source_record.lineage_name} after moving cluster {cluster_id}")
+        combined = self.recompute_embeddings(
+            combined,
+            f"{destination_record.lineage_name} after receiving cluster {assigned_cluster_id}",
+        )
+
+        source_temp_path = self._stage_object_write(
+            source_record,
+            remaining,
+            prefix=f"{source_record.object_path.stem}_move_out_",
+        )
+        try:
+            destination_temp_path = self._stage_object_write(
+                destination_record,
+                combined,
+                prefix=f"{destination_record.object_path.stem}_move_in_",
+            )
+        except Exception:
+            source_temp_path.unlink(missing_ok=True)
+            self._clear_latest_move_snapshot()
+            raise
+
+        try:
+            self._commit_staged_object(source_record, remaining, source_temp_path)
+            self._commit_staged_object(destination_record, combined, destination_temp_path)
+        except Exception:
+            source_temp_path.unlink(missing_ok=True)
+            destination_temp_path.unlink(missing_ok=True)
+            self._clear_latest_move_snapshot()
+            raise
+
+        return {
+            "source_object_id": source_record.object_id,
+            "source_object_path": str(source_record.object_path),
+            "destination_object_id": destination_record.object_id,
+            "destination_object_path": str(destination_record.object_path),
+            "cluster_key": cluster_key,
+            "cluster_id": assigned_cluster_id,
+            "display_name": moved_display_name,
+            "n_moved_cells": n_moved,
+            "n_overwritten_cells": int(preview["n_overwritten_cells"]),
+        }
+
     def polygon_select(
         self,
         record: ObjectRecord,
@@ -685,7 +1372,8 @@ class AnnDataService:
 
         rows: list[dict[str, Any]] = []
         counts = pd.Series(cluster_values).value_counts(sort=False)
-        for cluster_id in sorted(counts.index.tolist(), key=lambda value: str(value)):
+        ordered_cluster_ids = pd.Index(cluster_values).drop_duplicates().tolist()
+        for cluster_id in ordered_cluster_ids:
             mask = cluster_values == cluster_id
             display_values = pd.Series(existing_display[mask]).replace("", pd.NA).dropna()
             display_name = str(display_values.iloc[0]) if not display_values.empty else None
@@ -785,6 +1473,15 @@ class AnnDataService:
         }
 
     def _write_object(self, record: ObjectRecord, adata: ad.AnnData, prefix: str) -> None:
+        temp_path = self._stage_object_write(record, adata, prefix=prefix)
+        try:
+            self._commit_staged_object(record, adata, temp_path)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    def _stage_object_write(self, record: ObjectRecord, adata: ad.AnnData, prefix: str) -> Path:
+        adata.obs = _normalize_obs_for_write(adata.obs)
         with NamedTemporaryFile(
             prefix=prefix,
             suffix=".h5ad",
@@ -800,11 +1497,14 @@ class AnnDataService:
                 missing = sorted({"X", "obs", "var", "obsm", "uns"}.difference(saved.keys()))
                 if missing:
                     raise ValueError(f"Missing required groups after save: {', '.join(missing)}")
-            temp_path.replace(record.object_path)
         except Exception:
             temp_path.unlink(missing_ok=True)
             raise
 
+        return temp_path
+
+    def _commit_staged_object(self, record: ObjectRecord, adata: ad.AnnData, temp_path: Path) -> None:
+        temp_path.replace(record.object_path)
         self.replace_cached(record.object_id, adata)
 
 

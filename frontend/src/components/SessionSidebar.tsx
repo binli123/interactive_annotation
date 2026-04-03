@@ -6,6 +6,8 @@ const paletteOptions: PaletteName[] = ['bright', 'earth', 'pastel']
 
 export default function SessionSidebar() {
   const state = useStore((store) => ({
+    activeViewMode: store.activeViewMode,
+    setActiveViewMode: store.setActiveViewMode,
     metadata: store.metadata,
     embeddingKey: store.embeddingKey,
     clusterKey: store.clusterKey,
@@ -18,6 +20,18 @@ export default function SessionSidebar() {
     minPerCluster: store.minPerCluster,
     setMaxPoints: store.setMaxPoints,
     setMinPerCluster: store.setMinPerCluster,
+    globalMetadata: store.globalMetadata,
+    globalEmbeddingKey: store.globalEmbeddingKey,
+    globalClusterKey: store.globalClusterKey,
+    setGlobalEmbeddingKey: store.setGlobalEmbeddingKey,
+    setGlobalClusterKey: store.setGlobalClusterKey,
+    loadGlobalUmap: store.loadGlobalUmap,
+    refreshGlobalPointClusters: store.refreshGlobalPointClusters,
+    globalMaxPoints: store.globalMaxPoints,
+    globalMinPerCluster: store.globalMinPerCluster,
+    setGlobalMaxPoints: store.setGlobalMaxPoints,
+    setGlobalMinPerCluster: store.setGlobalMinPerCluster,
+    globalHighlight: store.globalHighlight,
     colorMode: store.colorMode,
     geneColorGene: store.geneColorGene,
     setColorMode: store.setColorMode,
@@ -81,98 +95,184 @@ export default function SessionSidebar() {
     <div className="sidebar-stack">
       <section className="panel">
         <h2>View</h2>
-        <label className="field">
-          <span>Embedding</span>
-          <select
-            value={state.embeddingKey}
-            onChange={(event) => {
-              const value = event.target.value
-              state.setEmbeddingKey(value)
-              void state.loadUmap({ embeddingKey: value })
-            }}
-            disabled={!state.metadata}
+        <div className="tab-strip">
+          <button
+            className={`tab-button ${state.activeViewMode === 'lineage' ? 'is-active' : ''}`}
+            onClick={() => state.setActiveViewMode('lineage')}
           >
-            {(state.metadata?.embedding_keys ?? []).map((key) => (
-              <option key={key} value={key}>
-                {key}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field">
-          <span>Cluster key</span>
-          <select
-            value={state.clusterKey}
-            onChange={(event) => {
-              const value = event.target.value
-              state.setClusterKey(value)
-              void state.refreshPointClusters(value)
-              void state.loadClusterLabelEditor()
-            }}
-            disabled={!state.metadata}
-          >
-            {(state.metadata?.cluster_keys ?? []).map((key) => (
-              <option key={key} value={key}>
-                {key}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="two-col">
-          <label className="field">
-            <span>Max points</span>
-            <input
-              type="number"
-              value={state.maxPoints}
-              onChange={(event) => state.setMaxPoints(Number(event.target.value))}
-            />
-          </label>
-          <label className="field">
-            <span>Min/cluster</span>
-            <input
-              type="number"
-              value={state.minPerCluster}
-              onChange={(event) => state.setMinPerCluster(Number(event.target.value))}
-            />
-          </label>
-        </div>
-        <div className="button-row">
-          <button className="button" onClick={() => void state.loadUmap()} disabled={state.busy}>
-            Reload UMAP
+            Lineage
           </button>
-          <select
-            value={state.colorMode}
-            onChange={(event) =>
-              state.setColorMode(event.target.value as 'cluster' | 'annotation' | 'gene')
-            }
+          <button
+            className={`tab-button ${state.activeViewMode === 'global' ? 'is-active' : ''}`}
+            onClick={() => state.setActiveViewMode('global')}
           >
-            <option value="cluster">Color by cluster</option>
-            <option value="annotation">Color by annotation</option>
-            {state.geneColorGene ? (
-              <option value="gene">Color by gene: {state.geneColorGene}</option>
-            ) : null}
-          </select>
+            Global
+          </button>
         </div>
-        <button
-          className="button button-secondary"
-          onClick={state.restoreClusterColorView}
-          disabled={state.colorMode === 'cluster'}
-        >
-          Restore cluster colors
-        </button>
-        <button
-          className="button button-secondary"
-          onClick={() => void state.promoteReannotNewToCanonical()}
-          disabled={!canPromoteReannotNew || state.busy}
-        >
-          Use reannot_label_new as canonical
-        </button>
-        {resolutionKeys.length > 0 ? (
-          <p className="muted">Available resolutions: {resolutionKeys.join(', ')}</p>
-        ) : null}
-        {!canPromoteReannotNew && state.metadata ? (
-          <p className="muted">`reannot_label_new` is not available on this object.</p>
-        ) : null}
+        {state.activeViewMode === 'lineage' ? (
+          <>
+            <label className="field">
+              <span>Embedding</span>
+              <select
+                value={state.embeddingKey}
+                onChange={(event) => {
+                  const value = event.target.value
+                  state.setEmbeddingKey(value)
+                  void state.loadUmap({ embeddingKey: value })
+                }}
+                disabled={!state.metadata}
+              >
+                {(state.metadata?.embedding_keys ?? []).map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Cluster key</span>
+              <select
+                value={state.clusterKey}
+                onChange={(event) => {
+                  const value = event.target.value
+                  state.setClusterKey(value)
+                  void state.refreshPointClusters(value)
+                  void state.loadClusterLabelEditor()
+                }}
+                disabled={!state.metadata}
+              >
+                {(state.metadata?.cluster_keys ?? []).map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="two-col">
+              <label className="field">
+                <span>Max points</span>
+                <input
+                  type="number"
+                  value={state.maxPoints}
+                  onChange={(event) => state.setMaxPoints(Number(event.target.value))}
+                />
+              </label>
+              <label className="field">
+                <span>Min/cluster</span>
+                <input
+                  type="number"
+                  value={state.minPerCluster}
+                  onChange={(event) => state.setMinPerCluster(Number(event.target.value))}
+                />
+              </label>
+            </div>
+            <div className="button-row">
+              <button className="button" onClick={() => void state.loadUmap()} disabled={state.busy}>
+                Reload UMAP
+              </button>
+              <select
+                value={state.colorMode}
+                onChange={(event) =>
+                  state.setColorMode(event.target.value as 'cluster' | 'annotation' | 'gene')
+                }
+              >
+                <option value="cluster">Color by cluster</option>
+                <option value="annotation">Color by annotation</option>
+                {state.geneColorGene ? (
+                  <option value="gene">Color by gene: {state.geneColorGene}</option>
+                ) : null}
+              </select>
+            </div>
+            <button
+              className="button button-secondary"
+              onClick={state.restoreClusterColorView}
+              disabled={state.colorMode === 'cluster'}
+            >
+              Restore cluster colors
+            </button>
+            <button
+              className="button button-secondary"
+              onClick={() => void state.promoteReannotNewToCanonical()}
+              disabled={!canPromoteReannotNew || state.busy}
+            >
+              Use reannot_label_new as canonical
+            </button>
+            {resolutionKeys.length > 0 ? (
+              <p className="muted">Available resolutions: {resolutionKeys.join(', ')}</p>
+            ) : null}
+            {!canPromoteReannotNew && state.metadata ? (
+              <p className="muted">`reannot_label_new` is not available on this object.</p>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <label className="field">
+              <span>Embedding</span>
+              <select
+                value={state.globalEmbeddingKey}
+                onChange={(event) => {
+                  const value = event.target.value
+                  state.setGlobalEmbeddingKey(value)
+                  void state.loadGlobalUmap({ embeddingKey: value })
+                }}
+                disabled={!state.globalMetadata}
+              >
+                {(state.globalMetadata?.embedding_keys ?? []).map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Cluster key</span>
+              <select
+                value={state.globalClusterKey}
+                onChange={(event) => {
+                  const value = event.target.value
+                  state.setGlobalClusterKey(value)
+                  void state.refreshGlobalPointClusters(value)
+                }}
+                disabled={!state.globalMetadata}
+              >
+                {(state.globalMetadata?.cluster_keys ?? []).map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="two-col">
+              <label className="field">
+                <span>Max points</span>
+                <input
+                  type="number"
+                  value={state.globalMaxPoints}
+                  onChange={(event) => state.setGlobalMaxPoints(Number(event.target.value))}
+                />
+              </label>
+              <label className="field">
+                <span>Min/cluster</span>
+                <input
+                  type="number"
+                  value={state.globalMinPerCluster}
+                  onChange={(event) => state.setGlobalMinPerCluster(Number(event.target.value))}
+                />
+              </label>
+            </div>
+            <button className="button" onClick={() => void state.loadGlobalUmap()} disabled={state.busy}>
+              Reload Global UMAP
+            </button>
+            {state.globalHighlight ? (
+              <p className="muted">
+                Highlighting {state.globalHighlight.sourceClusterName} with{' '}
+                {state.globalHighlight.highlightedDisplayed.toLocaleString()} visible matches.
+              </p>
+            ) : (
+              <p className="muted">Standard global cluster colors are active.</p>
+            )}
+          </>
+        )}
       </section>
 
       <section className="panel">

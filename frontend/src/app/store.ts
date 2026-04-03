@@ -6,6 +6,10 @@ import type {
   GeneCatalogResponse,
   MarkerDiscoveryResponse,
   MetadataResponse,
+  MoveClusterPreviewResponse,
+  MoveClusterResponse,
+  MoveClusterUndoResponse,
+  MoveClusterUndoStatusResponse,
   ObjectCard,
   PaletteName,
   PolygonRecord,
@@ -19,7 +23,7 @@ import type {
 } from './types'
 
 const defaultFolder =
-  import.meta.env.VITE_DEFAULT_FOLDER ?? '/data/lineages_current'
+  import.meta.env.VITE_DEFAULT_FOLDER ?? ''
 
 const favoriteGenesStorageKey = 'interactive_annotation_favorite_genes'
 
@@ -64,23 +68,69 @@ function moveArrayItem(values: string[], fromIndex: number, toIndex: number): st
   return next
 }
 
+function preferredGlobalClusterKey(metadata?: MetadataResponse): string {
+  if (!metadata) {
+    return ''
+  }
+  if (metadata.cluster_keys.includes('final_valid_lineage')) {
+    return 'final_valid_lineage'
+  }
+  return metadata.default_cluster_key ?? ''
+}
+
+function samePointSequence(left: UmapPoint[], right: UmapPoint[]): boolean {
+  if (left.length !== right.length) {
+    return false
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index]?.index !== right[index]?.index) {
+      return false
+    }
+  }
+  return true
+}
+
 type PropagationScope =
   | 'polygon_only'
   | 'selected_clusters_only'
   | 'same_connected_neighborhood'
   | 'whole_lineage'
 
+type ViewMode = 'lineage' | 'global'
+
+type GlobalHighlightState = {
+  sourceObjectId: string
+  sourceClusterKey: string
+  sourceClusterId: string
+  sourceClusterName: string
+  highlightedTotal: number
+  highlightedDisplayed: number
+}
+
 export type StoreState = {
   apiBase: string
   folderPath: string
   objects: ObjectCard[]
   selectedObjectId: string
+  activeViewMode: ViewMode
   metadata?: MetadataResponse
   points: UmapPoint[]
   embeddingKey: string
   clusterKey: string
   maxPoints: number
   minPerCluster: number
+  globalMetadata?: MetadataResponse
+  globalPoints: UmapPoint[]
+  globalBasePoints: UmapPoint[]
+  globalEmbeddingKey: string
+  globalClusterKey: string
+  globalMaxPoints: number
+  globalMinPerCluster: number
+  globalHighlight?: GlobalHighlightState
+  moveClusterPreview?: MoveClusterPreviewResponse
+  moveClusterResult?: MoveClusterResponse
+  moveClusterUndoStatus?: MoveClusterUndoStatusResponse
+  moveClusterUndoResult?: MoveClusterUndoResponse
   polygons: PolygonRecord[]
   draftVertices: number[][]
   isDrawing: boolean
@@ -122,12 +172,18 @@ export type StoreState = {
   busy: boolean
   error?: string
   scanFolder: () => Promise<void>
+  loadGlobalMetadata: () => Promise<void>
   selectObject: (objectId: string) => Promise<void>
+  setActiveViewMode: (value: ViewMode) => void
   setFolderPath: (value: string) => void
   setEmbeddingKey: (value: string) => void
   setClusterKey: (value: string) => void
   setMaxPoints: (value: number) => void
   setMinPerCluster: (value: number) => void
+  setGlobalEmbeddingKey: (value: string) => void
+  setGlobalClusterKey: (value: string) => void
+  setGlobalMaxPoints: (value: number) => void
+  setGlobalMinPerCluster: (value: number) => void
   setColorMode: (value: 'cluster' | 'annotation' | 'gene') => void
   setPropagationMethod: (value: 'graph_diffusion' | 'knn_vote') => void
   setPropagationScope: (value: PropagationScope) => void
@@ -163,6 +219,18 @@ export type StoreState = {
     clusterKey?: string
     geneName?: string | null
   }) => Promise<void>
+  loadGlobalUmap: (overrides?: {
+    embeddingKey?: string
+    clusterKey?: string
+  }) => Promise<void>
+  refreshGlobalPointClusters: (clusterKey?: string) => Promise<void>
+  highlightClusterInGlobal: (clusterId: string, clusterName: string) => Promise<void>
+  restoreGlobalClusterColors: () => Promise<void>
+  previewMoveCluster: (clusterId: string, destinationObjectId: string) => Promise<void>
+  clearMoveClusterPreview: () => void
+  moveClusterToObject: (clusterId: string, destinationObjectId: string) => Promise<void>
+  loadMoveClusterUndoStatus: () => Promise<void>
+  undoLatestMoveCluster: () => Promise<void>
   refreshPointClusters: (clusterKey?: string) => Promise<void>
   propagate: () => Promise<void>
   refreshSessionSummary: () => Promise<void>
@@ -191,12 +259,25 @@ export const useStore = create<StoreState>((set, get) => ({
   folderPath: defaultFolder,
   objects: [],
   selectedObjectId: '',
+  activeViewMode: 'lineage',
   metadata: undefined,
   points: [],
   embeddingKey: '',
   clusterKey: '',
   maxPoints: 50000,
   minPerCluster: 250,
+  globalMetadata: undefined,
+  globalPoints: [],
+  globalBasePoints: [],
+  globalEmbeddingKey: '',
+  globalClusterKey: '',
+  globalMaxPoints: 100000,
+  globalMinPerCluster: 250,
+  globalHighlight: undefined,
+  moveClusterPreview: undefined,
+  moveClusterResult: undefined,
+  moveClusterUndoStatus: undefined,
+  moveClusterUndoResult: undefined,
   polygons: [],
   draftVertices: [],
   isDrawing: false,
@@ -244,6 +325,7 @@ export const useStore = create<StoreState>((set, get) => ({
       const objects = await api.scanFolder(get().apiBase, get().folderPath)
       const preferredObject = objects.find((object) => object.is_valid) ?? objects[0]
       set({ objects, selectedObjectId: preferredObject?.object_id ?? '', busy: false })
+      await get().loadMoveClusterUndoStatus()
       if (preferredObject?.is_valid) {
         await get().selectObject(preferredObject.object_id)
       } else if (preferredObject) {
@@ -258,7 +340,32 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
+  async loadGlobalMetadata() {
+    try {
+      const metadata = await api.getGlobalMetadata(get().apiBase)
+      const defaultClusterKey = preferredGlobalClusterKey(metadata)
+      set((state) => ({
+        globalMetadata: metadata,
+        globalEmbeddingKey: state.globalEmbeddingKey || metadata.default_embedding_key,
+        globalClusterKey: state.globalClusterKey || defaultClusterKey
+      }))
+      await get().loadGlobalUmap({
+        embeddingKey: metadata.default_embedding_key,
+        clusterKey: defaultClusterKey
+      })
+    } catch (error) {
+      set({
+        globalMetadata: undefined,
+        globalPoints: [],
+        globalBasePoints: [],
+        globalHighlight: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
   async selectObject(objectId) {
+    const hadGlobalHighlight = Boolean(get().globalHighlight)
     set({
       busy: true,
       error: undefined,
@@ -289,7 +396,10 @@ export const useStore = create<StoreState>((set, get) => ({
       geneColorGene: undefined,
       dotplotResult: undefined,
       markerDiscoveryTargets: [],
-      markerDiscoveryResult: undefined
+      markerDiscoveryResult: undefined,
+      moveClusterPreview: undefined,
+      moveClusterResult: undefined,
+      moveClusterUndoResult: undefined
     })
     try {
       const metadata = await api.getMetadata(get().apiBase, objectId)
@@ -304,12 +414,18 @@ export const useStore = create<StoreState>((set, get) => ({
         clusterKey: metadata.default_cluster_key ?? '',
         geneName: null
       })
-      await Promise.all([get().loadClusterLabelEditor(), get().loadGenes()])
+      await Promise.all([get().loadClusterLabelEditor(), get().loadGenes(), get().loadMoveClusterUndoStatus()])
+      if (hadGlobalHighlight) {
+        await get().restoreGlobalClusterColors()
+      }
     } catch (error) {
       set({ busy: false, error: error instanceof Error ? error.message : String(error) })
     }
   },
 
+  setActiveViewMode(value) {
+    set({ activeViewMode: value })
+  },
   setFolderPath(value) {
     set({ folderPath: value })
   },
@@ -326,7 +442,9 @@ export const useStore = create<StoreState>((set, get) => ({
       sourceClusters: [],
       referencePropagationResult: undefined,
       markerDiscoveryTargets: [],
-      markerDiscoveryResult: undefined
+      markerDiscoveryResult: undefined,
+      moveClusterPreview: undefined,
+      moveClusterResult: undefined
     })
   },
   setMaxPoints(value) {
@@ -334,6 +452,18 @@ export const useStore = create<StoreState>((set, get) => ({
   },
   setMinPerCluster(value) {
     set({ minPerCluster: value })
+  },
+  setGlobalEmbeddingKey(value) {
+    set({ globalEmbeddingKey: value })
+  },
+  setGlobalClusterKey(value) {
+    set({ globalClusterKey: value })
+  },
+  setGlobalMaxPoints(value) {
+    set({ globalMaxPoints: value })
+  },
+  setGlobalMinPerCluster(value) {
+    set({ globalMinPerCluster: value })
   },
   setColorMode(value) {
     set({ colorMode: value })
@@ -527,6 +657,237 @@ export const useStore = create<StoreState>((set, get) => ({
         random_seed: 13
       })
       set({ points: response.points, busy: false })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async loadGlobalUmap(overrides) {
+    const { globalEmbeddingKey, globalClusterKey, globalMaxPoints, globalMinPerCluster } = get()
+    const nextEmbeddingKey = overrides?.embeddingKey ?? globalEmbeddingKey
+    const nextClusterKey = overrides?.clusterKey ?? globalClusterKey
+    if (!nextEmbeddingKey) {
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const response = await api.getGlobalUmap(get().apiBase, {
+        embedding_key: nextEmbeddingKey,
+        cluster_key: nextClusterKey || null,
+        gene_name: null,
+        max_points: globalMaxPoints,
+        min_per_cluster: globalMinPerCluster,
+        random_seed: 13
+      })
+      set({
+        globalPoints: response.points,
+        globalBasePoints: response.points,
+        globalHighlight: undefined,
+        busy: false
+      })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async refreshGlobalPointClusters(nextClusterKey) {
+    const { globalClusterKey, globalPoints, globalBasePoints, globalHighlight } = get()
+    const effectiveClusterKey = nextClusterKey ?? globalClusterKey
+    if (!effectiveClusterKey || (globalPoints.length === 0 && globalBasePoints.length === 0)) {
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const basePoints = globalBasePoints.length > 0 ? globalBasePoints : globalPoints
+      const baseResponse = await api.getGlobalPointClusters(get().apiBase, {
+        cluster_key: effectiveClusterKey,
+        indices: basePoints.map((point) => point.index)
+      })
+      const baseClusterMap = new Map(baseResponse.values.map((row) => [row.index, row.cluster] as const))
+
+      let currentClusterMap = baseClusterMap
+      if (globalHighlight && !samePointSequence(globalPoints, basePoints)) {
+        const currentResponse = await api.getGlobalPointClusters(get().apiBase, {
+          cluster_key: effectiveClusterKey,
+          indices: globalPoints.map((point) => point.index)
+        })
+        currentClusterMap = new Map(currentResponse.values.map((row) => [row.index, row.cluster] as const))
+      }
+
+      set((state) => ({
+        globalBasePoints: basePoints.map((point) => ({
+          ...point,
+          cluster: baseClusterMap.get(point.index) ?? point.cluster
+        })),
+        globalPoints: state.globalPoints.map((point) => ({
+          ...point,
+          cluster: currentClusterMap.get(point.index) ?? point.cluster
+        })),
+        busy: false
+      }))
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async highlightClusterInGlobal(clusterId, clusterName) {
+    const {
+      selectedObjectId,
+      clusterKey,
+      globalEmbeddingKey,
+      globalClusterKey,
+      globalMaxPoints,
+      globalMinPerCluster
+    } = get()
+    if (!selectedObjectId || !clusterKey || !globalEmbeddingKey) {
+      set({ error: 'Load both the lineage object and the global object first.' })
+      return
+    }
+    set({ busy: true, error: undefined })
+    try {
+      const response = await api.highlightGlobalFromObject(get().apiBase, {
+        source_object_id: selectedObjectId,
+        source_cluster_key: clusterKey,
+        source_cluster_id: clusterId,
+        embedding_key: globalEmbeddingKey,
+        cluster_key: globalClusterKey || null,
+        max_points: globalMaxPoints,
+        min_per_cluster: globalMinPerCluster,
+        random_seed: 13
+      })
+      set({
+        globalPoints: response.points,
+        globalHighlight: {
+          sourceObjectId: selectedObjectId,
+          sourceClusterKey: clusterKey,
+          sourceClusterId: clusterId,
+          sourceClusterName: clusterName,
+          highlightedTotal: response.highlighted_total ?? 0,
+          highlightedDisplayed: response.highlighted_displayed ?? 0
+        },
+        activeViewMode: 'global',
+        busy: false
+      })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async restoreGlobalClusterColors() {
+    const { globalHighlight, globalBasePoints } = get()
+    if (!globalHighlight) {
+      return
+    }
+    set({
+      globalPoints: globalBasePoints,
+      globalHighlight: undefined
+    })
+  },
+
+  async previewMoveCluster(clusterId, destinationObjectId) {
+    const { selectedObjectId, clusterKey } = get()
+    if (!selectedObjectId || !clusterKey || !destinationObjectId) {
+      set({ moveClusterPreview: undefined })
+      return
+    }
+    set({ busy: true, error: undefined, moveClusterPreview: undefined })
+    try {
+      const preview = await api.previewMoveCluster(get().apiBase, selectedObjectId, {
+        destination_object_id: destinationObjectId,
+        cluster_key: clusterKey,
+        cluster_id: clusterId
+      })
+      set({ moveClusterPreview: preview, busy: false })
+    } catch (error) {
+      set({
+        busy: false,
+        moveClusterPreview: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  clearMoveClusterPreview() {
+    set({ moveClusterPreview: undefined })
+  },
+
+  async moveClusterToObject(clusterId, destinationObjectId) {
+    const { selectedObjectId, clusterKey } = get()
+    if (!selectedObjectId || !clusterKey) {
+      set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (!destinationObjectId) {
+      set({ error: 'Select a destination object first.' })
+      return
+    }
+    set({ busy: true, error: undefined, moveClusterResult: undefined })
+    try {
+      const result = await api.moveCluster(get().apiBase, selectedObjectId, {
+        destination_object_id: destinationObjectId,
+        cluster_key: clusterKey,
+        cluster_id: clusterId,
+        allow_overwrite: true
+      })
+      const objects = await api.scanFolder(get().apiBase, get().folderPath)
+      await get().selectObject(selectedObjectId)
+      const undoStatus = await api.getMoveClusterUndoStatus(get().apiBase)
+      set({
+        objects,
+        moveClusterPreview: undefined,
+        moveClusterResult: result,
+        moveClusterUndoStatus: undoStatus,
+        moveClusterUndoResult: undefined,
+        busy: false
+      })
+      if (get().globalHighlight?.sourceClusterId === clusterId) {
+        await get().restoreGlobalClusterColors()
+      }
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  async loadMoveClusterUndoStatus() {
+    try {
+      const status = await api.getMoveClusterUndoStatus(get().apiBase)
+      set({ moveClusterUndoStatus: status })
+    } catch (error) {
+      set({
+        moveClusterUndoStatus: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  async undoLatestMoveCluster() {
+    const { selectedObjectId } = get()
+    set({
+      busy: true,
+      error: undefined,
+      moveClusterResult: undefined,
+      moveClusterUndoResult: undefined
+    })
+    try {
+      const result = await api.undoMoveCluster(get().apiBase)
+      const objects = await api.scanFolder(get().apiBase, get().folderPath)
+      const nextSelectedObjectId =
+        objects.find((object) => object.object_id === selectedObjectId)?.object_id ??
+        objects.find((object) => object.is_valid)?.object_id ??
+        ''
+      if (nextSelectedObjectId) {
+        await get().selectObject(nextSelectedObjectId)
+      }
+      const undoStatus = await api.getMoveClusterUndoStatus(get().apiBase)
+      set({
+        objects,
+        moveClusterUndoStatus: undoStatus,
+        moveClusterUndoResult: result,
+        busy: false
+      })
+      if (get().globalHighlight) {
+        await get().restoreGlobalClusterColors()
+      }
     } catch (error) {
       set({ busy: false, error: error instanceof Error ? error.message : String(error) })
     }

@@ -17,6 +17,10 @@ class Settings:
         "INTERACTIVE_ANNOTATION_LINEAGE_ROOT",
         "/data/lineages_current",
     )
+    default_global_object_path: Path = _path_env(
+        "INTERACTIVE_ANNOTATION_GLOBAL_OBJECT_PATH",
+        "/data/adata_global.h5ad",
+    )
     max_cached_objects: int = int(os.environ.get("INTERACTIVE_ANNOTATION_MAX_CACHED_OBJECTS", "2"))
     default_display_points: int = int(os.environ.get("INTERACTIVE_ANNOTATION_DEFAULT_DISPLAY_POINTS", "50000"))
     min_points_per_cluster: int = int(os.environ.get("INTERACTIVE_ANNOTATION_MIN_POINTS_PER_CLUSTER", "250"))

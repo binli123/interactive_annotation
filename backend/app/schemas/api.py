@@ -61,6 +61,7 @@ class UmapPoint(BaseModel):
     current_label: str | None = None
     current_score: float | None = None
     gene_expression: float | None = None
+    is_highlighted: bool | None = None
 
 
 class UmapResponse(BaseModel):
@@ -70,6 +71,8 @@ class UmapResponse(BaseModel):
     gene_name: str | None = None
     total_cells: int
     displayed_cells: int
+    highlighted_total: int | None = None
+    highlighted_displayed: int | None = None
     points: list[UmapPoint]
 
 
@@ -316,3 +319,77 @@ class SaveClusterLabelsResponse(BaseModel):
     cluster_key: str
     display_column: str
     n_updated: int
+
+
+class HighlightGlobalRequest(BaseModel):
+    source_object_id: str
+    source_cluster_key: str
+    source_cluster_id: str
+    embedding_key: str
+    cluster_key: str | None = None
+    max_points: int = 50000
+    min_per_cluster: int = 250
+    random_seed: int = 13
+
+
+class MoveClusterRequest(BaseModel):
+    destination_object_id: str
+    cluster_key: str
+    cluster_id: str
+    allow_overwrite: bool = False
+
+
+class MoveClusterPreviewResponse(BaseModel):
+    source_object_id: str
+    source_object_path: str
+    destination_object_id: str
+    destination_object_path: str
+    cluster_key: str
+    source_cluster_id: str
+    assigned_cluster_id: str
+    display_name: str
+    n_moved_cells: int
+    n_overwritten_cells: int
+
+
+class MoveClusterResponse(BaseModel):
+    source_object_id: str
+    source_object_path: str
+    destination_object_id: str
+    destination_object_path: str
+    cluster_key: str
+    cluster_id: str
+    display_name: str
+    n_moved_cells: int
+    n_overwritten_cells: int
+
+
+class MoveClusterUndoStatusResponse(BaseModel):
+    available: bool
+    source_object_id: str | None = None
+    source_object_path: str | None = None
+    destination_object_id: str | None = None
+    destination_object_path: str | None = None
+    cluster_key: str | None = None
+    source_cluster_id: str | None = None
+    assigned_cluster_id: str | None = None
+    display_name: str | None = None
+    n_moved_cells: int | None = None
+    n_overwritten_cells: int | None = None
+    created_at: str | None = None
+
+
+class MoveClusterUndoResponse(BaseModel):
+    available: bool
+    restored: bool
+    source_object_id: str
+    source_object_path: str
+    destination_object_id: str
+    destination_object_path: str
+    cluster_key: str
+    source_cluster_id: str
+    assigned_cluster_id: str
+    display_name: str
+    n_moved_cells: int
+    n_overwritten_cells: int
+    created_at: str

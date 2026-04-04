@@ -535,6 +535,8 @@ class AnnDataService:
         else:
             default_embedding = embedding_keys[0]
         default_cluster = next((key for key in ("reannot_label", "reannot_display_label") if key in cluster_keys), None)
+        if default_cluster is None and record.lineage_name == "Global" and "final_valid_lineage" in cluster_keys:
+            default_cluster = "final_valid_lineage"
         if default_cluster is None:
             default_cluster = cluster_keys[0] if cluster_keys else None
         return {

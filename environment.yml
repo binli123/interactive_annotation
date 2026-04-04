@@ -1,0 +1,12 @@
+name: st_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - nodejs=20
+  - pip
+  - pip:
+      - -r backend/requirements.txt
+      - scanpy>=1.11
+      - matplotlib>=3.8
+      - h5py>=3.10

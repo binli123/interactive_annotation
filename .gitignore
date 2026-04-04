@@ -28,3 +28,11 @@ sample_data/*
 .env
 .env.*
 .venv/
+
+# Local runtime/test artifacts
+.move_undo/
+.mplconfig/
+.numba_cache/
+.cache/
+.docker_test_adata_ENS_current.h5ad.bak
+.move_test_backup/

@@ -1,377 +1,555 @@
-# Interactive Annotation User Guide
+# Interactive Annotation App
 
-This project is a local interactive tool for viewing lineage `.h5ad` objects, drawing polygon seeds on UMAP embeddings, propagating labels, editing cluster display names, exploring genes, and saving reannotation results back into the selected object.
+This app helps you view lineage `.h5ad` files, inspect UMAPs, draw polygons, propagate annotations, rename clusters, examine genes, and move clusters between lineage objects.
 
-This guide is based on the current frontend and backend code in this repository. The primary startup path below is local development without Docker, using the existing Conda environment `st_env`.
+This guide is written for someone with beginner coding skills. You do not need Docker for local development, but a Docker option is included later in this guide if you want a more portable setup.
 
-## What the app does
+## What You Need
 
-- scans a lineage folder for viewable `.h5ad` objects
-- loads UMAP or other 2D embeddings from `obsm`
-- colors cells by cluster, annotation, or single-gene expression
-- lets you draw polygons to seed new labels
-- propagates those labels with either kNN vote or graph diffusion
-- edits human-readable cluster names and cluster visibility
-- runs reference-based reassignment from selected reference clusters to selected source clusters
-- discovers candidate marker genes and renders marker dotplots
-- saves reannotation outputs and sidecar files beside the source object
+Before you start, make sure you have:
 
-## Requirements
+- this repository on your computer
+- Miniforge installed
+- a terminal
+- a web browser
 
-- Conda with an existing environment named `st_env`
-- Node.js and npm for the frontend
-- one or more lineage `.h5ad` files
+You do not need to install Python or Node.js separately if you use the Conda environment in this guide, because the new `environment.yml` includes both.
 
-The backend dependencies required by this repo are already available in `st_env` on this machine. If you need to install or refresh them later, run:
+## Folder Layout
 
-```bash
-conda run -n st_env pip install -r backend/requirements.txt
-```
+Important folders:
 
-## Expected data layout
+- `backend/`: Python backend
+- `frontend/`: React frontend
+- `data/lineages_current/`: lineage-specific `.h5ad` objects
+- `data/adata_global.h5ad`: global object for comparative viewing
+- `scripts/`: helper scripts for setup and running the app
 
-By default the app looks for lineage objects under `data/lineages_current`.
+## Quick Start
 
-Supported layouts:
+If you want the shortest version:
 
-```text
-data/lineages_current/
-  lineage_a/
-    object_a.h5ad
-    recluster_manifest.json              # optional
-  lineage_b/
-    object_b.h5ad
-  summary_resolution_trials.csv          # optional
-```
-
-or:
-
-```text
-data/lineages_current/
-  object_a.h5ad
-  object_b.h5ad
-```
-
-The scanner also accepts a wrapper `lineages/` directory, so this works too:
-
-```text
-data/lineages_current/
-  lineages/
-    lineage_a/
-      object_a.h5ad
-```
-
-Notes:
-
-- No sample `.h5ad` files are bundled in this repo.
-- A viewable object must be a readable AnnData file with at least one embedding in `obsm`.
-- Propagation and reference-based relabeling also need a PCA-like embedding in `obsm` because the backend uses PCA features for kNN operations.
-
-## Start locally without Docker
-
-Open two terminals from the repository root.
-
-### 1. Start the backend
+1. install Miniforge
+2. open a terminal in this repository
+3. run:
 
 ```bash
-cd /path/to/interactive_annotation
-REPO_ROOT="$(pwd)"
-
-conda activate st_env
-cd "$REPO_ROOT/backend"
-
-export INTERACTIVE_ANNOTATION_PROJECT_ROOT="$REPO_ROOT"
-export INTERACTIVE_ANNOTATION_DATA_ROOT="$REPO_ROOT/data"
-export INTERACTIVE_ANNOTATION_LINEAGE_ROOT="$REPO_ROOT/data/lineages_current"
-export INTERACTIVE_ANNOTATION_CORS_ORIGINS="http://127.0.0.1:5173,http://localhost:5173"
-
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+bash scripts/setup_local.sh
 ```
 
-If `conda activate` is not initialized in your shell, use `conda run -n st_env ...` instead.
-
-Health check:
+4. open a second terminal and run:
 
 ```bash
-curl http://127.0.0.1:8000/health
+bash scripts/run_backend.sh
 ```
 
-Expected response:
-
-```json
-{"status":"ok","default_lineage_root":"/path/to/interactive_annotation/data/lineages_current"}
-```
-
-### 2. Start the frontend
+5. open a third terminal and run:
 
 ```bash
-cd /path/to/interactive_annotation
-REPO_ROOT="$(pwd)"
-
-cd "$REPO_ROOT/frontend"
-npm install
-
-VITE_DEFAULT_FOLDER="$REPO_ROOT/data/lineages_current" \
-npm run dev -- --host 127.0.0.1 --port 5173
+bash scripts/run_frontend.sh
 ```
 
-Open:
+6. open your browser at:
 
 ```text
 http://127.0.0.1:5173
 ```
 
-Notes:
+## Step 1: Install Miniforge
 
-- In dev mode, Vite proxies `/api` to `http://127.0.0.1:8000`.
-- `VITE_DEFAULT_FOLDER` pre-fills the folder shown in the UI. You can still scan a different folder from the app.
-- Stop the app with `Ctrl+C` in each terminal.
+If you do not already have Conda, install Miniforge first:
 
-## First-time local smoke test
+- https://github.com/conda-forge/miniforge
 
-1. Put one or more `.h5ad` files under `data/lineages_current`.
-2. Start the backend and frontend using the commands above.
-3. Open `http://127.0.0.1:5173`.
-4. In `Objects`, confirm the folder path is correct and click `Scan`.
-5. Load a valid object and confirm points appear in the UMAP panel.
+After installation, open a new terminal.
 
-## Main workflow
+Check that Conda works:
 
-### 1. Load an object
+```bash
+conda --version
+```
 
-Use the `Objects` panel on the left:
+If that does not work, restart your terminal and try again.
 
-- `Lineage folder`: the folder to scan for `.h5ad` objects
-- `Scan`: refresh the object list
-- `Detected objects`: select the object to load
+## Step 2: Set Up The Environment
 
-When an object loads, the app also loads:
+From the project root, run:
 
-- metadata
-- the default embedding
-- the default cluster key
-- cluster label editor data
-- full gene catalog
+```bash
+bash scripts/setup_local.sh
+```
 
-### 2. Inspect the embedding
+What this does:
 
-Use the `View` and `Visualization` panels:
+- creates or updates the Conda environment `st_env`
+- installs Python packages from `environment.yml`
+- installs frontend packages in `frontend/`
 
-- change `Embedding`
-- change `Cluster key`
-- adjust `Max points` and `Min/cluster` for sampling
-- click `Reload UMAP` after changing sampling settings
-- color by cluster, annotation, or a selected gene
-- tune dot size, transparency, polygon boundary width, palette, and axis flips
+The environment file is:
 
-The app samples large objects for display. The full object is still used for backend operations.
+- [environment.yml](/Users/binli/Projects/interactive_annotation/environment.yml)
 
-### 3. Edit cluster names
+It includes:
 
-Use `Cluster Names` below the UMAP:
+- Python `3.10`
+- Node.js
+- backend packages
+- Scanpy, Matplotlib, and HDF5 support needed by the app
 
-- each row shows a cluster ID and its cell count
-- `Show` toggles visibility for that cluster in the UMAP
-- `Human-readable name` lets you assign a display name
-- `Save names to object` writes the display-name column into the selected `.h5ad`
+### Manual Setup If You Prefer
 
-The saved display column is inferred from the active cluster key. Examples:
+If you want to do the same work by hand:
 
-- `reannot_label` -> `reannot_display_label`
-- `reannot_label_new` -> `reannot_display_label_new`
-- `leiden_1_0` -> `leiden_1_0_display_name`
+```bash
+conda env create -f environment.yml
+conda activate st_env
+cd frontend
+npm install
+```
 
-### 4. Draw polygons to create seed labels
+If `st_env` already exists, use:
 
-Use the UMAP toolbar:
+```bash
+conda env update -n st_env -f environment.yml --prune
+conda activate st_env
+cd frontend
+npm install
+```
 
-- `Draw polygon` starts drawing mode
-- click on the plot to add vertices
-- `Close polygon` completes the polygon
-- `Undo point` removes the most recent draft vertex
-- `Clear draft` clears the in-progress polygon
-- `Clear all` removes all saved polygons from the current session
+## Step 3: Start The Backend
 
-After closing a polygon, use the `Polygons` panel:
+In a new terminal, from the project root, run:
 
-- `Cluster ID`: the label that propagation will assign
-- `Cluster name`: optional human-readable label
-- `Include in propagate`: include or exclude that polygon from the next run
-- `Cells inside` and `Leiden mix` summarize what the polygon captured
+```bash
+bash scripts/run_backend.sh
+```
 
-### 5. Propagate labels
+What this script does:
 
-Use the `Propagate` panel:
+- activates `st_env`
+- sets the required local environment variables
+- starts the backend on `127.0.0.1:8000`
 
-- `Method`
-  - `kNN vote`
-  - `Graph diffusion`
-- `Scope`
-  - `Polygon only`
-  - `Selected clusters only`
-  - `Same connected neighborhood`
-  - `Whole lineage`
-- `Annotate all`
-  - when enabled, score and margin thresholds are ignored
-- `Min score` and `Min margin`
-  - used only when `Annotate all` is off
-- `Graph smoothing`
-  - used only for graph diffusion
+The script is:
 
-Click `Propagate selected polygons` to run the current session.
+- [scripts/run_backend.sh](/Users/binli/Projects/interactive_annotation/scripts/run_backend.sh)
 
-What happens next:
+If the backend is healthy, this command should work in another terminal:
 
-- the app seeds cells from the included polygons
-- propagation results are shown on the UMAP using annotation colors
-- the `Session` panel reports seed counts and assigned counts
-- nothing is persisted to disk yet
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-Use `Reset propagation` to discard the current propagated result but keep polygons, or `Reset session` to clear polygons as well.
+You should see a JSON response with `"status":"ok"`.
 
-### 6. Run reference-based relabeling
+## Step 4: Start The Frontend
 
-Use `Propagate (Reference-Based)`:
+In another new terminal, from the project root, run:
 
-- choose the current `Cluster key` first
-- mark one or more `Reference` clusters
-- mark one or more disjoint `Source` clusters
-- set `Output name`
-- choose `kNN neighbors`
-- click `Apply kNN vote to source clusters`
+```bash
+bash scripts/run_frontend.sh
+```
 
-This creates new columns inside the selected object immediately:
+What this script does:
 
-- `reannot_label_<output_name>`
-- `reannot_display_label_<output_name>`
+- activates `st_env`
+- checks that frontend packages are installed
+- starts the Vite frontend on `127.0.0.1:5173`
+
+The script is:
+
+- [scripts/run_frontend.sh](/Users/binli/Projects/interactive_annotation/scripts/run_frontend.sh)
+
+## Step 5: Open The App In Your Browser
+
+Open:
+
+- `http://127.0.0.1:5173`
+
+You can also usually use:
+
+- `http://localhost:5173`
+
+## Optional: Run The App With Docker
+
+If you prefer Docker, the repository also includes a working Docker setup for the frontend and backend together.
+
+### Requirements
+
+- Docker Desktop
+- the `data/` folder present in this repository
+
+### Start The Docker App
+
+From the project root, run:
+
+```bash
+docker compose up --build
+```
+
+If you want it in the background:
+
+```bash
+docker compose up -d --build
+```
+
+Then open:
+
+- `http://127.0.0.1:5173`
+
+The Docker app uses:
+
+- frontend on port `5173`
+- backend inside Docker on port `8000`
+- the local `data/` folder mounted into the containers
+
+Important:
+
+- moving clusters and recomputing PCA/UMAP can take several minutes on large objects
+- changes are written to the mounted `.h5ad` files in `data/`
+- the Docker app reads the global object from `data/adata_global.h5ad`
+
+To stop it:
+
+```bash
+docker compose down
+```
+
+## What To Do When The App Opens
+
+1. wait for the page to load
+2. look at the left side of the app
+3. click `Scan`
+4. choose one of the lineage objects
+5. wait for the UMAP to load
+
+Large objects can take time to load. That is normal.
+
+## Main Parts Of The App
+
+The app has three main working areas:
+
+- left panel: object loading, view controls, propagation, and saving
+- center: the UMAP view
+- right panel: gene tools
+- bottom center: cluster names
+
+## Main Functionality
+
+## 1. Basic Loading, Waiting, And Viewing
+
+Use this workflow to open an object and explore it.
+
+### Load An Object
+
+1. click `Scan`
+2. choose an object such as `adata_Myeloid_current`
+3. wait for the UMAP to appear
+
+### Change What You See
+
+In the left `View` panel you can change:
+
+- `Embedding`
+- `Cluster key`
+- `Max points`
+- `Min/cluster`
+
+Then click:
+
+- `Reload UMAP`
+
+### What These Controls Mean
+
+- `Embedding`: which coordinate system to plot
+- `Cluster key`: which labels are used to color points
+- `Max points`: total number of cells drawn on screen
+- `Min/cluster`: minimum number of cells to keep per cluster in the sampled display
+
+### Lineage And Global Views
+
+In the `View` panel there are two tabs:
+
+- `Lineage`
+- `Global`
+
+Use them to switch between:
+
+- the current lineage-specific object
+- the global object
+
+The center plot also switches between these views.
+
+### Tips For Beginners
+
+- if the plot feels slow, reduce `Max points`
+- if the plot looks too sparse, increase `Max points`
+- if you get lost after zooming, click `Reset view`
+
+## 2. Draw A Polygon, Name It, Propagate It, And Save
+
+This is the main manual annotation workflow.
+
+### Step A: Prepare The View
+
+1. load an object
+2. make sure you are in the lineage view
+3. click `Reset view` if the plot is zoomed in a strange way
+
+### Step B: Draw A Polygon
+
+Use the buttons above the UMAP:
+
+- `Draw polygon`
+- `Close polygon`
+- `Undo point`
+- `Clear draft`
+
+Suggested workflow:
+
+1. click `Draw polygon`
+2. click around the cell cloud you want
+3. if you make a mistake, click `Undo point`
+4. if you want to restart, click `Clear draft`
+5. when the shape is finished, click `Close polygon`
+
+### Step C: Give The Polygon A New Cluster
+
+After the polygon is closed, go to the polygon section in the left panel.
+
+For the polygon, enter:
+
+- a numerical cluster ID
+- a human-readable name
 
 Example:
 
-- output name `new` creates `reannot_label_new` and `reannot_display_label_new`
+- cluster ID: `8`
+- human-readable name: `Macrophage candidate`
 
-After it runs, the app reloads the object and switches the active cluster key to the new column.
+### Step D: Propagate
 
-### 7. Promote `reannot_label_new` to canonical labels
+When your polygon is ready:
 
-If the current object contains `reannot_label_new`, the `View` panel exposes:
+1. make sure the polygon is enabled
+2. click `Propagate selected polygons`
+3. wait for the propagation to finish
 
-- `Use reannot_label_new as canonical`
+This can take time on large objects.
 
-This copies:
+### Step E: Save The Result
 
-- `reannot_label_new` -> `reannot_label`
-- `reannot_display_label_new` -> `reannot_display_label`
+When you are happy with the new annotation:
 
-The object is written back immediately.
+1. click `Save reannotated object`
 
-### 8. Explore genes and dotplots
+This writes the reannotation back into the current `.h5ad` file on disk.
 
-Use the right-side `Gene Examination` panel:
+Important:
 
-- search genes by symbol
-- tick genes to select them
-- use the heart button to favorite genes locally in browser storage
-- drag selected genes to reorder them for dotplots
+- this is an in-place save
+- the file really changes on disk
 
-Actions:
+## 3. Color UMAP By Gene And Use Dotplot
 
-- `Color UMAP by gene`
-  - requires exactly one selected gene
-- `Preview dotplot`
-  - renders a dotplot in the app only
-- `Save dotplot beside object`
-  - writes a PNG next to the selected `.h5ad`
+Use the right-side `Gene Examination` panel.
 
-### 9. Discover candidate marker genes
+### Color UMAP By One Gene
 
-Use `Marker Discovery` at the bottom of the gene panel:
+1. search for a gene
+2. select exactly one gene
+3. click `Color UMAP by gene`
 
-- only clusters currently checked in `Cluster Names` are used as the analysis universe
-- select one or more target clusters
-- choose `Candidate genes (N)`
-- click `Discover marker genes`
+The plot will switch from cluster colors to expression colors.
 
-The returned candidate genes are added to the selected-gene list so you can immediately preview or save a dotplot.
+If you want to return to cluster colors, click:
 
-### 10. Save the reannotated session
+- `Restore cluster colors`
 
-Use `Session -> Save reannotated object` after a polygon propagation run.
+### Preview A Dotplot
 
-This writes the propagated result into the selected `.h5ad` and also writes sidecar files beside it:
+1. select one or more genes
+2. click `Preview dotplot`
 
-- `<object>.session.json`
-- `<object>.polygons.geojson`
-- `<object>.summary.csv`
+This shows a dotplot in the app.
 
-The saved `.h5ad` receives reannotation fields including:
+### Save A Dotplot
 
-- `reannot_label`
-- `reannot_display_label`
-- `reannot_label_source`
-- `reannot_confidence`
-- `reannot_margin`
-- `reannot_seed`
-- `reannot_polygon_ids`
-- `reannot_scope`
-- `reannot_cluster_key`
-- `reannot_session_id`
-- `reannot_timestamp`
+1. select one or more genes
+2. click `Save dotplot beside object`
 
-## Important persistence behavior
+This saves a PNG file next to the current object.
 
-Several actions write directly back into the selected `.h5ad` in place. The backend writes to a temporary file in the same directory and then replaces the original file.
+## 4. Use The Cluster Names Panel
 
-Actions that persist immediately:
+The `Cluster Names` panel is at the bottom center.
 
-- `Save names to object`
-- `Apply kNN vote to source clusters`
-- `Use reannot_label_new as canonical`
-- `Save reannotated object`
+You can use it to:
 
-Also:
+- show or hide clusters
+- rename clusters
+- highlight a lineage cluster in the global view
+- move a cluster into another object
+- undo the latest move
 
-- `Save dotplot beside object` writes a PNG beside the object
-- `Preview dotplot` does not write a file
-- polygon drawing and normal propagation stay in memory until `Save reannotated object`
+### Rename A Cluster
 
-If you need to preserve an untouched source object, make a copy before using the save actions above.
+1. find the cluster row
+2. edit the text in the human-readable name box
+3. click `Save names to object`
 
-## Troubleshooting
+This writes the display names back into the current object.
 
-### The object list is empty
+### Highlight A Cluster In The Global View
 
-- confirm the folder exists
-- confirm the frontend default folder points to the correct absolute path
-- confirm your `.h5ad` files are under the scanned folder
+1. find the cluster row
+2. click `Highlight`
 
-### An object is marked invalid
+The app switches to the global view and highlights matching cells.
 
-Common reasons:
+If you want normal colors back, click:
 
-- the file is not a readable AnnData object
-- `obsm` is missing
-- `obsm` exists but contains no embeddings
-- required groups such as `var` are missing
+- `Restore cluster colors`
 
-### UMAP loads but propagation fails
+### Undo The Latest Move
 
-Propagation requires PCA-like features in `obsm`. The backend looks for:
+If you just moved a cluster and want to reverse that most recent move:
 
-- `X_pca_lineage`, or
-- another embedding key containing `pca`
+1. click `Undo Moving cluster`
 
-### Frontend cannot reach the backend
+Important:
 
-- confirm the backend is running on `127.0.0.1:8000`
-- confirm the frontend is running on `127.0.0.1:5173`
-- confirm `INTERACTIVE_ANNOTATION_CORS_ORIGINS` includes the frontend URL
+- this is a one-step undo for the latest move only
 
-## Docker note
+## 5. Example: Move One Cluster From Myeloid To Stromal
 
-Docker support still exists in this repo through `docker-compose.yml` and the `Makefile`, but this document is intentionally local-first. If you do want the container path later, the existing shortcuts are:
+Here is a real example using the current project objects.
+
+### Example Cluster
+
+- source object: `adata_Myeloid_current`
+- cluster key: `reannot_label`
+- cluster ID: `3`
+- cluster name: `CD163 macrophage`
+- destination object: `adata_Stromal_current`
+
+### Step-By-Step
+
+1. click `Scan`
+2. load `adata_Myeloid_current`
+3. make sure `Cluster key` is `reannot_label`
+4. go to the `Cluster Names` panel
+5. find cluster `3`
+6. click `Move to`
+7. choose `adata_Stromal_current`
+8. read the preview
+
+The preview tells you:
+
+- how many cells will be moved
+- how many destination `cell_id` values will be overwritten
+- the destination cluster ID that will be assigned
+- the destination display name
+
+If it looks correct:
+
+1. click `OK`
+2. wait
+
+Important:
+
+- this operation changes both objects
+- after the move, the app recomputes PCA and UMAP embeddings
+- this can take a while on large objects
+- in Docker, a large move can take a few minutes
+- do not close the backend while it is working
+
+After the move:
+
+- the source object loses that cluster
+- the destination object gains the moved cluster
+- the moved human-readable name stays readable instead of growing longer and longer with repeated suffixes
+
+If you want to reverse that latest move:
+
+1. click `Undo Moving cluster`
+
+## 6. Advanced Features Not Covered Here
+
+This beginner guide does not explain these advanced sections:
+
+- `Propagate (Reference-Based)`
+- `Marker Discovery`
+
+## Files Added For Easier Setup
+
+This repository now includes beginner-friendly setup files:
+
+- [environment.yml](/Users/binli/Projects/interactive_annotation/environment.yml)
+- [scripts/setup_local.sh](/Users/binli/Projects/interactive_annotation/scripts/setup_local.sh)
+- [scripts/run_backend.sh](/Users/binli/Projects/interactive_annotation/scripts/run_backend.sh)
+- [scripts/run_frontend.sh](/Users/binli/Projects/interactive_annotation/scripts/run_frontend.sh)
+
+## Common Problems
+
+### `conda` Is Not Found
+
+Install Miniforge, then open a new terminal and try again.
+
+### `conda activate st_env` Does Not Work
+
+Try:
 
 ```bash
-make up
-make down
-make logs
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate st_env
+```
+
+### The App Opens But You Do Not See Data
+
+Check:
+
+- the backend is running on `127.0.0.1:8000`
+- the frontend is running on `127.0.0.1:5173`
+- you clicked `Scan`
+- you selected a valid object
+
+### `Scan` Fails
+
+The intended lineage folder for this project is:
+
+```text
+/Users/binli/Projects/interactive_annotation/data/lineages_current
+```
+
+### I Want To Stop The App
+
+In the backend terminal and frontend terminal, press:
+
+```bash
+Ctrl+C
+```
+
+## Summary
+
+For most users, the full local workflow is just:
+
+```bash
+bash scripts/setup_local.sh
+```
+
+Then in two separate terminals:
+
+```bash
+bash scripts/run_backend.sh
+```
+
+```bash
+bash scripts/run_frontend.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5173
 ```

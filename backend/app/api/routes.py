@@ -141,6 +141,8 @@ def scan_folder(request: ScanFolderRequest) -> list[ObjectCard]:
         records = registry.scan(folder)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    for record in records:
+        adata_service.invalidate_cached(record.object_id)
     return [_object_card(record) for record in records]
 
 

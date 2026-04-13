@@ -18,17 +18,40 @@ import type {
   SaveClusterLabelsResponse,
   SaveResponse,
   SessionSummary,
-  UmapResponse
+  UmapResponse,
+  VisibleHighlightResponse
 } from './types'
 
+const activeRequestControllers = new Set<AbortController>()
+
+export function abortActiveRequests() {
+  for (const controller of activeRequestControllers) {
+    controller.abort()
+  }
+  activeRequestControllers.clear()
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {})
-    },
-    ...init
-  })
+  const controller = new AbortController()
+  activeRequestControllers.add(controller)
+  let response: Response
+  try {
+    response = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {})
+      },
+      ...init,
+      signal: controller.signal
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Stopped current request.')
+    }
+    throw error
+  } finally {
+    activeRequestControllers.delete(controller)
+  }
   if (!response.ok) {
     const text = await response.text()
     throw new Error(text || `Request failed: ${response.status}`)
@@ -52,11 +75,20 @@ export const api = {
   getGlobalMetadata(baseUrl: string) {
     return requestJson<MetadataResponse>(`${baseUrl}/global/metadata`)
   },
+  getGlobalGenes(baseUrl: string) {
+    return requestJson<GeneCatalogResponse>(`${baseUrl}/global/genes`)
+  },
   getGenes(baseUrl: string, objectId: string) {
     return requestJson<GeneCatalogResponse>(`${baseUrl}/objects/${objectId}/genes`)
   },
   getGeneExpression(baseUrl: string, objectId: string, payload: { gene_name: string; indices: number[] }) {
     return requestJson<GeneExpressionResponse>(`${baseUrl}/objects/${objectId}/gene-expression`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  getGlobalGeneExpression(baseUrl: string, payload: { gene_name: string; indices: number[] }) {
+    return requestJson<GeneExpressionResponse>(`${baseUrl}/global/gene-expression`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })
@@ -107,6 +139,20 @@ export const api = {
       body: JSON.stringify(payload)
     })
   },
+  getGlobalMarkerDotplot(
+    baseUrl: string,
+    payload: {
+      cluster_key: string
+      genes: string[]
+      save_to_object_dir?: boolean
+      output_name?: string | null
+    }
+  ) {
+    return requestJson<DotplotResponse>(`${baseUrl}/global/marker-dotplot`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
   referencePropagate(
     baseUrl: string,
     objectId: string,
@@ -147,6 +193,7 @@ export const api = {
       gene_name?: string | null
       max_points: number
       min_per_cluster: number
+      max_per_cluster: number
       random_seed: number
     }
   ) {
@@ -163,6 +210,7 @@ export const api = {
       gene_name?: string | null
       max_points: number
       min_per_cluster: number
+      max_per_cluster: number
       random_seed: number
     }
   ) {
@@ -181,10 +229,25 @@ export const api = {
       cluster_key?: string | null
       max_points: number
       min_per_cluster: number
+      max_per_cluster: number
       random_seed: number
     }
   ) {
     return requestJson<UmapResponse>(`${baseUrl}/global/highlight-from-object`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  highlightVisibleGlobalFromObject(
+    baseUrl: string,
+    payload: {
+      source_object_id: string
+      source_cluster_key: string
+      source_cluster_id: string
+      indices: number[]
+    }
+  ) {
+    return requestJson<VisibleHighlightResponse>(`${baseUrl}/global/highlight-visible-from-object`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })

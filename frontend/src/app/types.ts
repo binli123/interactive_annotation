@@ -56,6 +56,16 @@ export type UmapResponse = {
   points: UmapPoint[]
 }
 
+export type VisibleHighlightResponse = {
+  object_id: string
+  highlighted_total: number
+  highlighted_displayed: number
+  values: Array<{
+    index: number
+    is_highlighted: boolean
+  }>
+}
+
 export type PolygonGeometry = {
   polygon_id: string
   vertices: number[][]

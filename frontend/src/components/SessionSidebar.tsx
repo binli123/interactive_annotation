@@ -18,8 +18,10 @@ export default function SessionSidebar() {
     loadClusterLabelEditor: store.loadClusterLabelEditor,
     maxPoints: store.maxPoints,
     minPerCluster: store.minPerCluster,
+    maxPerCluster: store.maxPerCluster,
     setMaxPoints: store.setMaxPoints,
     setMinPerCluster: store.setMinPerCluster,
+    setMaxPerCluster: store.setMaxPerCluster,
     globalMetadata: store.globalMetadata,
     globalEmbeddingKey: store.globalEmbeddingKey,
     globalClusterKey: store.globalClusterKey,
@@ -29,12 +31,17 @@ export default function SessionSidebar() {
     refreshGlobalPointClusters: store.refreshGlobalPointClusters,
     globalMaxPoints: store.globalMaxPoints,
     globalMinPerCluster: store.globalMinPerCluster,
+    globalMaxPerCluster: store.globalMaxPerCluster,
     setGlobalMaxPoints: store.setGlobalMaxPoints,
     setGlobalMinPerCluster: store.setGlobalMinPerCluster,
+    setGlobalMaxPerCluster: store.setGlobalMaxPerCluster,
     globalHighlight: store.globalHighlight,
     colorMode: store.colorMode,
+    globalColorMode: store.globalColorMode,
     geneColorGene: store.geneColorGene,
+    globalGeneColorGene: store.globalGeneColorGene,
     setColorMode: store.setColorMode,
+    setGlobalColorMode: store.setGlobalColorMode,
     restoreClusterColorView: store.restoreClusterColorView,
     promoteReannotNewToCanonical: store.promoteReannotNewToCanonical,
     pointSize: store.pointSize,
@@ -50,6 +57,8 @@ export default function SessionSidebar() {
     setFlipHorizontal: store.setFlipHorizontal,
     setFlipVertical: store.setFlipVertical,
     polygons: store.polygons,
+    draftPolygonId: store.draftPolygonId,
+    editPolygonVertices: store.editPolygonVertices,
     updatePolygon: store.updatePolygon,
     removePolygon: store.removePolygon,
     propagationMethod: store.propagationMethod,
@@ -148,7 +157,7 @@ export default function SessionSidebar() {
                 ))}
               </select>
             </label>
-            <div className="two-col">
+            <div className="three-col">
               <label className="field">
                 <span>Max points</span>
                 <input
@@ -163,6 +172,15 @@ export default function SessionSidebar() {
                   type="number"
                   value={state.minPerCluster}
                   onChange={(event) => state.setMinPerCluster(Number(event.target.value))}
+                />
+              </label>
+              <label className="field">
+                <span>Max/cluster</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={state.maxPerCluster}
+                  onChange={(event) => state.setMaxPerCluster(Number(event.target.value))}
                 />
               </label>
             </div>
@@ -242,7 +260,7 @@ export default function SessionSidebar() {
                 ))}
               </select>
             </label>
-            <div className="two-col">
+            <div className="three-col">
               <label className="field">
                 <span>Max points</span>
                 <input
@@ -259,9 +277,36 @@ export default function SessionSidebar() {
                   onChange={(event) => state.setGlobalMinPerCluster(Number(event.target.value))}
                 />
               </label>
+              <label className="field">
+                <span>Max/cluster</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={state.globalMaxPerCluster}
+                  onChange={(event) => state.setGlobalMaxPerCluster(Number(event.target.value))}
+                />
+              </label>
             </div>
-            <button className="button" onClick={() => void state.loadGlobalUmap()} disabled={state.busy}>
-              Reload Global UMAP
+            <div className="button-row">
+              <button className="button" onClick={() => void state.loadGlobalUmap()} disabled={state.busy}>
+                Reload Global UMAP
+              </button>
+              <select
+                value={state.globalColorMode}
+                onChange={(event) => state.setGlobalColorMode(event.target.value as 'cluster' | 'gene')}
+              >
+                <option value="cluster">Color by cluster</option>
+                {state.globalGeneColorGene ? (
+                  <option value="gene">Color by gene: {state.globalGeneColorGene}</option>
+                ) : null}
+              </select>
+            </div>
+            <button
+              className="button button-secondary"
+              onClick={state.restoreClusterColorView}
+              disabled={state.globalColorMode === 'cluster' && !state.globalHighlight}
+            >
+              Restore cluster colors
             </button>
             {state.globalHighlight ? (
               <p className="muted">
@@ -384,6 +429,13 @@ export default function SessionSidebar() {
                       'NA'}
                   </div>
                 </div>
+                <button
+                  className="button button-secondary"
+                  onClick={() => state.editPolygonVertices(polygon.id)}
+                  disabled={state.busy}
+                >
+                  {state.draftPolygonId === polygon.id ? 'Editing vertices' : 'Edit vertices'}
+                </button>
                 <button
                   className="button button-secondary"
                   onClick={() => state.removePolygon(polygon.id)}

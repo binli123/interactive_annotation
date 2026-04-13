@@ -4,7 +4,9 @@ import { useStore } from '../app/store'
 export default function GenePanel() {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const state = useStore((store) => ({
+    activeViewMode: store.activeViewMode,
     geneCatalog: store.geneCatalog,
+    globalGeneCatalog: store.globalGeneCatalog,
     geneSearch: store.geneSearch,
     selectedGenes: store.selectedGenes,
     favoriteGenes: store.favoriteGenes,
@@ -28,11 +30,13 @@ export default function GenePanel() {
     busy: store.busy
   }))
 
+  const geneCatalog = state.activeViewMode === 'global' ? state.globalGeneCatalog : state.geneCatalog
+
   const favoriteSet = useMemo(() => new Set(state.favoriteGenes), [state.favoriteGenes])
   const selectedSet = useMemo(() => new Set(state.selectedGenes), [state.selectedGenes])
   const filteredGenes = useMemo(() => {
     const query = state.geneSearch.trim().toLowerCase()
-    const genes = state.geneCatalog?.genes ?? []
+    const genes = geneCatalog?.genes ?? []
     return genes
       .filter((gene) => (query ? gene.toLowerCase().includes(query) : true))
       .sort((left, right) => {
@@ -43,9 +47,9 @@ export default function GenePanel() {
         }
         return left.localeCompare(right)
       })
-  }, [favoriteSet, state.geneCatalog?.genes, state.geneSearch])
+  }, [favoriteSet, geneCatalog?.genes, state.geneSearch])
 
-  if (!state.geneCatalog) {
+  if (!geneCatalog) {
     return (
       <aside className="right-rail">
         <section className="panel">
@@ -62,7 +66,9 @@ export default function GenePanel() {
         <div className="cluster-label-header">
           <div>
             <h2>Gene Examination</h2>
-            <p className="muted">{state.geneCatalog.genes.length.toLocaleString()} genes in object</p>
+            <p className="muted">
+              {geneCatalog.genes.length.toLocaleString()} genes in {state.activeViewMode === 'global' ? 'global object' : 'lineage object'}
+            </p>
           </div>
           <button className="button button-secondary" onClick={state.clearSelectedGenes}>
             Uncheck all genes
@@ -166,7 +172,8 @@ export default function GenePanel() {
           ))}
         </div>
 
-        <section className="marker-discovery-panel">
+        {state.activeViewMode === 'lineage' ? (
+          <section className="marker-discovery-panel">
           <div className="cluster-label-header">
             <div>
               <h3>Marker Discovery</h3>
@@ -206,7 +213,17 @@ export default function GenePanel() {
               Added candidates: {state.markerDiscoveryResult.candidate_genes.join(', ') || 'none'}
             </p>
           ) : null}
-        </section>
+          </section>
+        ) : (
+          <section className="marker-discovery-panel">
+            <div className="cluster-label-header">
+              <div>
+                <h3>Marker Discovery</h3>
+                <p className="muted">Marker discovery is available only in Lineage View.</p>
+              </div>
+            </div>
+          </section>
+        )}
       </section>
     </aside>
   )

@@ -45,6 +45,7 @@ class UmapRequest(BaseModel):
     gene_name: str | None = None
     max_points: int = 50000
     min_per_cluster: int = 250
+    max_per_cluster: int = 0
     random_seed: int = 13
 
 
@@ -112,6 +113,25 @@ class PointClusterResponse(BaseModel):
     object_id: str
     cluster_key: str
     values: list[PointClusterValue]
+
+
+class VisibleHighlightRequest(BaseModel):
+    source_object_id: str
+    source_cluster_key: str
+    source_cluster_id: str
+    indices: list[int] = Field(default_factory=list)
+
+
+class VisibleHighlightValue(BaseModel):
+    index: int
+    is_highlighted: bool
+
+
+class VisibleHighlightResponse(BaseModel):
+    object_id: str
+    highlighted_total: int
+    highlighted_displayed: int
+    values: list[VisibleHighlightValue]
 
 
 class ReferencePropagateRequest(BaseModel):
@@ -329,6 +349,7 @@ class HighlightGlobalRequest(BaseModel):
     cluster_key: str | None = None
     max_points: int = 50000
     min_per_cluster: int = 250
+    max_per_cluster: int = 0
     random_seed: int = 13
 
 

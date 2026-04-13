@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api } from './api'
+import { abortActiveRequests, api } from './api'
 import type {
   ClusterLabelEditorResponse,
   DotplotResponse,
@@ -19,7 +19,8 @@ import type {
   SaveClusterLabelsResponse,
   SaveResponse,
   SessionSummary,
-  UmapPoint
+  UmapPoint,
+  VisibleHighlightResponse
 } from './types'
 
 const defaultFolder =
@@ -107,6 +108,8 @@ type GlobalHighlightState = {
   highlightedDisplayed: number
 }
 
+type ColorMode = 'cluster' | 'annotation' | 'gene'
+
 export type StoreState = {
   apiBase: string
   folderPath: string
@@ -119,6 +122,7 @@ export type StoreState = {
   clusterKey: string
   maxPoints: number
   minPerCluster: number
+  maxPerCluster: number
   globalMetadata?: MetadataResponse
   globalPoints: UmapPoint[]
   globalBasePoints: UmapPoint[]
@@ -126,6 +130,7 @@ export type StoreState = {
   globalClusterKey: string
   globalMaxPoints: number
   globalMinPerCluster: number
+  globalMaxPerCluster: number
   globalHighlight?: GlobalHighlightState
   moveClusterPreview?: MoveClusterPreviewResponse
   moveClusterResult?: MoveClusterResponse
@@ -133,6 +138,7 @@ export type StoreState = {
   moveClusterUndoResult?: MoveClusterUndoResponse
   polygons: PolygonRecord[]
   draftVertices: number[][]
+  draftPolygonId?: string
   isDrawing: boolean
   propagationMethod: 'graph_diffusion' | 'knn_vote'
   propagationScope: PropagationScope
@@ -160,16 +166,20 @@ export type StoreState = {
   referencePropagationNeighbors: number
   referencePropagationResult?: ReferencePropagateResponse
   geneCatalog?: GeneCatalogResponse
+  globalGeneCatalog?: GeneCatalogResponse
   geneSearch: string
   selectedGenes: string[]
   favoriteGenes: string[]
   geneColorGene?: string
+  globalGeneColorGene?: string
   dotplotResult?: DotplotResponse
   markerDiscoveryTargets: string[]
   markerDiscoveryTopN: number
   markerDiscoveryResult?: MarkerDiscoveryResponse
-  colorMode: 'cluster' | 'annotation' | 'gene'
+  colorMode: ColorMode
+  globalColorMode: Extract<ColorMode, 'cluster' | 'gene'>
   busy: boolean
+  busyMessage?: string
   error?: string
   scanFolder: () => Promise<void>
   loadGlobalMetadata: () => Promise<void>
@@ -180,11 +190,14 @@ export type StoreState = {
   setClusterKey: (value: string) => void
   setMaxPoints: (value: number) => void
   setMinPerCluster: (value: number) => void
+  setMaxPerCluster: (value: number) => void
   setGlobalEmbeddingKey: (value: string) => void
   setGlobalClusterKey: (value: string) => void
   setGlobalMaxPoints: (value: number) => void
   setGlobalMinPerCluster: (value: number) => void
-  setColorMode: (value: 'cluster' | 'annotation' | 'gene') => void
+  setGlobalMaxPerCluster: (value: number) => void
+  setColorMode: (value: ColorMode) => void
+  setGlobalColorMode: (value: Extract<ColorMode, 'cluster' | 'gene'>) => void
   setPropagationMethod: (value: 'graph_diffusion' | 'knn_vote') => void
   setPropagationScope: (value: PropagationScope) => void
   setMinScore: (value: number) => void
@@ -208,9 +221,11 @@ export type StoreState = {
   startDrawing: () => void
   stopDrawing: () => void
   addDraftVertex: (vertex: number[]) => void
+  updateDraftVertex: (index: number, vertex: number[]) => void
   undoDraftVertex: () => void
   finalizeDraftPolygon: () => Promise<void>
   clearDraftPolygon: () => void
+  editPolygonVertices: (polygonId: string) => void
   updatePolygon: (polygonId: string, updates: Partial<PolygonRecord>) => void
   removePolygon: (polygonId: string) => void
   clearPolygons: () => void
@@ -241,6 +256,7 @@ export type StoreState = {
   updateClusterLabelName: (clusterId: string, displayName: string) => void
   saveClusterLabelEditor: () => Promise<void>
   loadGenes: () => Promise<void>
+  loadGlobalGenes: () => Promise<void>
   setGeneSearch: (value: string) => void
   toggleGeneSelected: (gene: string) => void
   clearSelectedGenes: () => void
@@ -252,6 +268,7 @@ export type StoreState = {
   colorBySelectedGene: () => Promise<void>
   previewDotplot: () => Promise<void>
   saveDotplot: () => Promise<void>
+  stopCurrentTask: () => void
 }
 
 export const useStore = create<StoreState>((set, get) => ({
@@ -266,6 +283,7 @@ export const useStore = create<StoreState>((set, get) => ({
   clusterKey: '',
   maxPoints: 50000,
   minPerCluster: 250,
+  maxPerCluster: 0,
   globalMetadata: undefined,
   globalPoints: [],
   globalBasePoints: [],
@@ -273,6 +291,7 @@ export const useStore = create<StoreState>((set, get) => ({
   globalClusterKey: '',
   globalMaxPoints: 100000,
   globalMinPerCluster: 250,
+  globalMaxPerCluster: 0,
   globalHighlight: undefined,
   moveClusterPreview: undefined,
   moveClusterResult: undefined,
@@ -280,6 +299,7 @@ export const useStore = create<StoreState>((set, get) => ({
   moveClusterUndoResult: undefined,
   polygons: [],
   draftVertices: [],
+  draftPolygonId: undefined,
   isDrawing: false,
   propagationMethod: 'knn_vote',
   propagationScope: 'selected_clusters_only',
@@ -307,28 +327,38 @@ export const useStore = create<StoreState>((set, get) => ({
   referencePropagationNeighbors: 15,
   referencePropagationResult: undefined,
   geneCatalog: undefined,
+  globalGeneCatalog: undefined,
   geneSearch: '',
   selectedGenes: [],
   favoriteGenes: loadFavoriteGenes(),
   geneColorGene: undefined,
+  globalGeneColorGene: undefined,
   dotplotResult: undefined,
   markerDiscoveryTargets: [],
   markerDiscoveryTopN: 10,
   markerDiscoveryResult: undefined,
   colorMode: 'cluster',
+  globalColorMode: 'cluster',
   busy: false,
+  busyMessage: undefined,
   error: undefined,
 
   async scanFolder() {
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Scanning objects', error: undefined })
     try {
       const objects = await api.scanFolder(get().apiBase, get().folderPath)
       const preferredObject = objects.find((object) => object.is_valid) ?? objects[0]
-      set({ objects, selectedObjectId: preferredObject?.object_id ?? '', busy: false })
-      await get().loadMoveClusterUndoStatus()
-      if (preferredObject?.is_valid) {
-        await get().selectObject(preferredObject.object_id)
-      } else if (preferredObject) {
+      set({
+        objects,
+        selectedObjectId: preferredObject?.object_id ?? '',
+        busy: false,
+        busyMessage: undefined
+      })
+      await Promise.all([
+        get().loadMoveClusterUndoStatus(),
+        preferredObject?.is_valid ? get().selectObject(preferredObject.object_id) : Promise.resolve()
+      ])
+      if (!preferredObject?.is_valid && preferredObject) {
         set({
           error:
             preferredObject.validation_error ??
@@ -336,7 +366,11 @@ export const useStore = create<StoreState>((set, get) => ({
         })
       }
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -349,16 +383,20 @@ export const useStore = create<StoreState>((set, get) => ({
         globalEmbeddingKey: state.globalEmbeddingKey || metadata.default_embedding_key,
         globalClusterKey: state.globalClusterKey || defaultClusterKey
       }))
-      await get().loadGlobalUmap({
-        embeddingKey: metadata.default_embedding_key,
-        clusterKey: defaultClusterKey
-      })
+      await Promise.all([
+        get().loadGlobalUmap({
+          embeddingKey: metadata.default_embedding_key,
+          clusterKey: defaultClusterKey
+        }),
+        get().loadGlobalGenes()
+      ])
     } catch (error) {
       set({
         globalMetadata: undefined,
         globalPoints: [],
         globalBasePoints: [],
         globalHighlight: undefined,
+        globalGeneCatalog: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -368,12 +406,14 @@ export const useStore = create<StoreState>((set, get) => ({
     const hadGlobalHighlight = Boolean(get().globalHighlight)
     set({
       busy: true,
+      busyMessage: 'Loading object',
       error: undefined,
       selectedObjectId: objectId,
       metadata: undefined,
       points: [],
       polygons: [],
       draftVertices: [],
+      draftPolygonId: undefined,
       isDrawing: false,
       colorMode: 'cluster',
       sessionId: randomSessionId(),
@@ -403,23 +443,56 @@ export const useStore = create<StoreState>((set, get) => ({
     })
     try {
       const metadata = await api.getMetadata(get().apiBase, objectId)
+      const nextClusterKey = metadata.default_cluster_key ?? ''
+      const nextEmbeddingKey = metadata.default_embedding_key
       set({
         metadata,
-        embeddingKey: metadata.default_embedding_key,
-        clusterKey: metadata.default_cluster_key ?? '',
-        busy: false
+        embeddingKey: nextEmbeddingKey,
+        clusterKey: nextClusterKey
       })
-      await get().loadUmap({
-        embeddingKey: metadata.default_embedding_key,
-        clusterKey: metadata.default_cluster_key ?? '',
-        geneName: null
-      })
-      await Promise.all([get().loadClusterLabelEditor(), get().loadGenes(), get().loadMoveClusterUndoStatus()])
+      await Promise.all([
+        api
+          .getUmap(get().apiBase, objectId, {
+            embedding_key: nextEmbeddingKey,
+            cluster_key: nextClusterKey || null,
+            gene_name: null,
+            max_points: get().maxPoints,
+            min_per_cluster: get().minPerCluster,
+            max_per_cluster: get().maxPerCluster,
+            random_seed: 13
+          })
+          .then((response) => set({ points: response.points })),
+        api
+          .getClusterLabelEditor(get().apiBase, objectId, nextClusterKey)
+          .then((editor) => {
+            const nextVisibility = Object.fromEntries(
+              editor.rows.map((row) => [row.cluster_id, get().clusterVisibility[row.cluster_id] ?? true])
+            )
+            set({
+              clusterLabelEditor: editor,
+              clusterLabelSaveResult: undefined,
+              clusterVisibility: nextVisibility
+            })
+          }),
+        api.getGenes(get().apiBase, objectId).then((geneCatalog) =>
+          set((state) => ({
+            geneCatalog,
+            selectedGenes: state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+            dotplotResult: undefined
+          }))
+        ),
+        api.getMoveClusterUndoStatus(get().apiBase).then((moveClusterUndoStatus) => set({ moveClusterUndoStatus }))
+      ])
+      set({ busy: false, busyMessage: undefined })
       if (hadGlobalHighlight) {
         await get().restoreGlobalClusterColors()
       }
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -453,6 +526,9 @@ export const useStore = create<StoreState>((set, get) => ({
   setMinPerCluster(value) {
     set({ minPerCluster: value })
   },
+  setMaxPerCluster(value) {
+    set({ maxPerCluster: value })
+  },
   setGlobalEmbeddingKey(value) {
     set({ globalEmbeddingKey: value })
   },
@@ -465,8 +541,14 @@ export const useStore = create<StoreState>((set, get) => ({
   setGlobalMinPerCluster(value) {
     set({ globalMinPerCluster: value })
   },
+  setGlobalMaxPerCluster(value) {
+    set({ globalMaxPerCluster: value })
+  },
   setColorMode(value) {
     set({ colorMode: value })
+  },
+  setGlobalColorMode(value) {
+    set({ globalColorMode: value })
   },
   setPropagationMethod(value) {
     set({ propagationMethod: value })
@@ -513,7 +595,11 @@ export const useStore = create<StoreState>((set, get) => ({
     }))
   },
   restoreClusterColorView() {
-    set({ colorMode: 'cluster' })
+    if (get().activeViewMode === 'global') {
+      void get().restoreGlobalClusterColors()
+      return
+    }
+    set({ colorMode: 'cluster', geneColorGene: undefined })
   },
   async promoteReannotNewToCanonical() {
     const { selectedObjectId } = get()
@@ -562,10 +648,10 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   startDrawing() {
-    set({ isDrawing: true, draftVertices: [], error: undefined })
+    set({ isDrawing: true, draftVertices: [], draftPolygonId: undefined, error: undefined })
   },
   stopDrawing() {
-    set({ isDrawing: false })
+    set({ isDrawing: false, draftVertices: [], draftPolygonId: undefined })
   },
   addDraftVertex(vertex) {
     if (!get().isDrawing) {
@@ -573,11 +659,18 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     set((state) => ({ draftVertices: [...state.draftVertices, vertex] }))
   },
+  updateDraftVertex(index, vertex) {
+    set((state) => ({
+      draftVertices: state.draftVertices.map((current, currentIndex) =>
+        currentIndex === index ? vertex : current
+      )
+    }))
+  },
   undoDraftVertex() {
     set((state) => ({ draftVertices: state.draftVertices.slice(0, -1) }))
   },
   async finalizeDraftPolygon() {
-    const { selectedObjectId, embeddingKey, clusterKey, draftVertices } = get()
+    const { selectedObjectId, embeddingKey, clusterKey, draftVertices, draftPolygonId } = get()
     if (draftVertices.length < 3) {
       set({ error: 'A polygon needs at least three points.' })
       return
@@ -589,36 +682,70 @@ export const useStore = create<StoreState>((set, get) => ({
 
     const polygonId = randomPolygonId()
     const vertices = [...draftVertices, draftVertices[0]]
-    set({ busy: true, error: undefined })
+    const effectivePolygonId = draftPolygonId ?? polygonId
+    set({ busy: true, busyMessage: draftPolygonId ? 'Updating polygon' : 'Closing polygon', error: undefined })
     try {
       const selection = await api.polygonSelect(get().apiBase, selectedObjectId, {
         embedding_key: embeddingKey,
         cluster_key: clusterKey,
-        polygons: [{ polygon_id: polygonId, vertices }]
+        polygons: [{ polygon_id: effectivePolygonId, vertices }]
       })
       const summary = selection.polygon_summaries[0]
       const dominantCluster = summary?.clusters[0]?.cluster ?? ''
       const polygon: PolygonRecord = {
-        id: polygonId,
+        id: effectivePolygonId,
         vertices,
-        clusterId: dominantCluster,
-        clusterName: '',
+        clusterId:
+          get().polygons.find((entry) => entry.id === effectivePolygonId)?.clusterId ?? dominantCluster,
+        clusterName:
+          get().polygons.find((entry) => entry.id === effectivePolygonId)?.clusterName ?? '',
         includeForPropagation: true,
         nCells: summary?.n_cells ?? 0,
         clusterSummary: summary?.clusters ?? []
       }
-      set((state) => ({
-        polygons: [...state.polygons, polygon],
-        draftVertices: [],
-        isDrawing: false,
-        busy: false
-      }))
+      set((state) => {
+        const existingIndex = state.polygons.findIndex((entry) => entry.id === effectivePolygonId)
+        const polygons =
+          existingIndex >= 0
+            ? state.polygons.map((entry) => (entry.id === effectivePolygonId ? { ...entry, ...polygon } : entry))
+            : [...state.polygons, polygon]
+        return {
+          polygons,
+          draftVertices: [],
+          draftPolygonId: undefined,
+          isDrawing: false,
+          busy: false,
+          busyMessage: undefined
+        }
+      })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
   clearDraftPolygon() {
-    set({ draftVertices: [] })
+    set({ draftVertices: [], draftPolygonId: undefined, isDrawing: false })
+  },
+  editPolygonVertices(polygonId) {
+    const polygon = get().polygons.find((entry) => entry.id === polygonId)
+    if (!polygon) {
+      return
+    }
+    const openVertices =
+      polygon.vertices.length > 1 &&
+      polygon.vertices[0][0] === polygon.vertices[polygon.vertices.length - 1][0] &&
+      polygon.vertices[0][1] === polygon.vertices[polygon.vertices.length - 1][1]
+        ? polygon.vertices.slice(0, -1)
+        : polygon.vertices
+    set({
+      isDrawing: true,
+      draftPolygonId: polygonId,
+      draftVertices: openVertices.map((vertex) => [...vertex]),
+      error: undefined
+    })
   },
   updatePolygon(polygonId, updates) {
     set((state) => ({
@@ -637,7 +764,16 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async loadUmap(overrides) {
-    const { selectedObjectId, embeddingKey, clusterKey, maxPoints, minPerCluster, colorMode, geneColorGene } =
+    const {
+      selectedObjectId,
+      embeddingKey,
+      clusterKey,
+      maxPoints,
+      minPerCluster,
+      maxPerCluster,
+      colorMode,
+      geneColorGene
+    } =
       get()
     const nextEmbeddingKey = overrides?.embeddingKey ?? embeddingKey
     const nextClusterKey = overrides?.clusterKey ?? clusterKey
@@ -646,7 +782,7 @@ export const useStore = create<StoreState>((set, get) => ({
     if (!selectedObjectId || !nextEmbeddingKey) {
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Loading lineage UMAP', error: undefined })
     try {
       const response = await api.getUmap(get().apiBase, selectedObjectId, {
         embedding_key: nextEmbeddingKey,
@@ -654,39 +790,58 @@ export const useStore = create<StoreState>((set, get) => ({
         gene_name: nextGeneName,
         max_points: maxPoints,
         min_per_cluster: minPerCluster,
+        max_per_cluster: maxPerCluster,
         random_seed: 13
       })
-      set({ points: response.points, busy: false })
+      set({ points: response.points, busy: false, busyMessage: undefined })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
   async loadGlobalUmap(overrides) {
-    const { globalEmbeddingKey, globalClusterKey, globalMaxPoints, globalMinPerCluster } = get()
+    const {
+      globalEmbeddingKey,
+      globalClusterKey,
+      globalMaxPoints,
+      globalMinPerCluster,
+      globalMaxPerCluster,
+      globalColorMode,
+      globalGeneColorGene
+    } = get()
     const nextEmbeddingKey = overrides?.embeddingKey ?? globalEmbeddingKey
     const nextClusterKey = overrides?.clusterKey ?? globalClusterKey
     if (!nextEmbeddingKey) {
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Loading global UMAP', error: undefined })
     try {
       const response = await api.getGlobalUmap(get().apiBase, {
         embedding_key: nextEmbeddingKey,
         cluster_key: nextClusterKey || null,
-        gene_name: null,
+        gene_name: globalColorMode === 'gene' ? globalGeneColorGene ?? null : null,
         max_points: globalMaxPoints,
         min_per_cluster: globalMinPerCluster,
+        max_per_cluster: globalMaxPerCluster,
         random_seed: 13
       })
       set({
         globalPoints: response.points,
         globalBasePoints: response.points,
         globalHighlight: undefined,
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -696,7 +851,7 @@ export const useStore = create<StoreState>((set, get) => ({
     if (!effectiveClusterKey || (globalPoints.length === 0 && globalBasePoints.length === 0)) {
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Refreshing global cluster colors', error: undefined })
     try {
       const basePoints = globalBasePoints.length > 0 ? globalBasePoints : globalPoints
       const baseResponse = await api.getGlobalPointClusters(get().apiBase, {
@@ -723,40 +878,40 @@ export const useStore = create<StoreState>((set, get) => ({
           ...point,
           cluster: currentClusterMap.get(point.index) ?? point.cluster
         })),
-        busy: false
+        busy: false,
+        busyMessage: undefined
       }))
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
   async highlightClusterInGlobal(clusterId, clusterName) {
-    const {
-      selectedObjectId,
-      clusterKey,
-      globalEmbeddingKey,
-      globalClusterKey,
-      globalMaxPoints,
-      globalMinPerCluster
-    } = get()
-    if (!selectedObjectId || !clusterKey || !globalEmbeddingKey) {
+    const { selectedObjectId, clusterKey, globalBasePoints, globalPoints } = get()
+    const basePoints = globalBasePoints.length > 0 ? globalBasePoints : globalPoints
+    if (!selectedObjectId || !clusterKey || basePoints.length === 0) {
       set({ error: 'Load both the lineage object and the global object first.' })
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Highlighting visible global sample', error: undefined })
     try {
-      const response = await api.highlightGlobalFromObject(get().apiBase, {
+      const response: VisibleHighlightResponse = await api.highlightVisibleGlobalFromObject(get().apiBase, {
         source_object_id: selectedObjectId,
         source_cluster_key: clusterKey,
         source_cluster_id: clusterId,
-        embedding_key: globalEmbeddingKey,
-        cluster_key: globalClusterKey || null,
-        max_points: globalMaxPoints,
-        min_per_cluster: globalMinPerCluster,
-        random_seed: 13
+        indices: basePoints.map((point) => point.index)
       })
+      const highlightMap = new Map(response.values.map((row) => [row.index, row.is_highlighted] as const))
+      const highlightedPoints = basePoints.map((point) => ({
+        ...point,
+        is_highlighted: highlightMap.get(point.index) ?? false
+      }))
       set({
-        globalPoints: response.points,
+        globalPoints: highlightedPoints,
         globalHighlight: {
           sourceObjectId: selectedObjectId,
           sourceClusterKey: clusterKey,
@@ -765,22 +920,28 @@ export const useStore = create<StoreState>((set, get) => ({
           highlightedTotal: response.highlighted_total ?? 0,
           highlightedDisplayed: response.highlighted_displayed ?? 0
         },
+        globalColorMode: 'cluster',
+        globalGeneColorGene: undefined,
         activeViewMode: 'global',
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
   async restoreGlobalClusterColors() {
     const { globalHighlight, globalBasePoints } = get()
-    if (!globalHighlight) {
-      return
-    }
     set({
       globalPoints: globalBasePoints,
-      globalHighlight: undefined
+      globalHighlight: undefined,
+      globalColorMode: 'cluster',
+      globalGeneColorGene: undefined
     })
   },
 
@@ -790,17 +951,18 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ moveClusterPreview: undefined })
       return
     }
-    set({ busy: true, error: undefined, moveClusterPreview: undefined })
+    set({ busy: true, busyMessage: 'Previewing move', error: undefined, moveClusterPreview: undefined })
     try {
       const preview = await api.previewMoveCluster(get().apiBase, selectedObjectId, {
         destination_object_id: destinationObjectId,
         cluster_key: clusterKey,
         cluster_id: clusterId
       })
-      set({ moveClusterPreview: preview, busy: false })
+      set({ moveClusterPreview: preview, busy: false, busyMessage: undefined })
     } catch (error) {
       set({
         busy: false,
+        busyMessage: undefined,
         moveClusterPreview: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
@@ -821,7 +983,7 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ error: 'Select a destination object first.' })
       return
     }
-    set({ busy: true, error: undefined, moveClusterResult: undefined })
+    set({ busy: true, busyMessage: 'Moving cluster', error: undefined, moveClusterResult: undefined })
     try {
       const result = await api.moveCluster(get().apiBase, selectedObjectId, {
         destination_object_id: destinationObjectId,
@@ -838,13 +1000,18 @@ export const useStore = create<StoreState>((set, get) => ({
         moveClusterResult: result,
         moveClusterUndoStatus: undoStatus,
         moveClusterUndoResult: undefined,
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
       if (get().globalHighlight?.sourceClusterId === clusterId) {
         await get().restoreGlobalClusterColors()
       }
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -864,6 +1031,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const { selectedObjectId } = get()
     set({
       busy: true,
+      busyMessage: 'Undoing latest move',
       error: undefined,
       moveClusterResult: undefined,
       moveClusterUndoResult: undefined
@@ -883,13 +1051,18 @@ export const useStore = create<StoreState>((set, get) => ({
         objects,
         moveClusterUndoStatus: undoStatus,
         moveClusterUndoResult: result,
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
       if (get().globalHighlight) {
         await get().restoreGlobalClusterColors()
       }
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -899,7 +1072,7 @@ export const useStore = create<StoreState>((set, get) => ({
     if (!selectedObjectId || !effectiveClusterKey || points.length === 0) {
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Refreshing cluster colors', error: undefined })
     try {
       const response = await api.getPointClusters(get().apiBase, selectedObjectId, {
         cluster_key: effectiveClusterKey,
@@ -911,10 +1084,15 @@ export const useStore = create<StoreState>((set, get) => ({
           ...point,
           cluster: clusterMap.get(point.index) ?? point.cluster
         })),
-        busy: false
+        busy: false,
+        busyMessage: undefined
       }))
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -966,7 +1144,7 @@ export const useStore = create<StoreState>((set, get) => ({
         .map((row) => [row.cluster_id, (row.display_name ?? '').trim()] as const)
         .filter(([, displayName]) => displayName.length > 0)
     )
-    set({ busy: true, error: undefined, clusterLabelSaveResult: undefined })
+    set({ busy: true, busyMessage: 'Saving cluster names', error: undefined, clusterLabelSaveResult: undefined })
     try {
       const result = await api.saveClusterLabelEditor(get().apiBase, selectedObjectId, {
         cluster_key: clusterKey,
@@ -977,12 +1155,17 @@ export const useStore = create<StoreState>((set, get) => ({
       set({
         metadata,
         clusterLabelSaveResult: result,
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
       await get().loadClusterLabelEditor()
       await get().loadUmap({ clusterKey: get().clusterKey })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -1003,7 +1186,7 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ error: 'Select at least one reference cluster and one source cluster.' })
       return
     }
-    set({ busy: true, error: undefined, referencePropagationResult: undefined })
+    set({ busy: true, busyMessage: 'Running reference propagation', error: undefined, referencePropagationResult: undefined })
     try {
       const result = await api.referencePropagate(get().apiBase, selectedObjectId, {
         cluster_key: clusterKey,
@@ -1025,7 +1208,11 @@ export const useStore = create<StoreState>((set, get) => ({
       await get().loadClusterLabelEditor()
       await get().loadUmap({ clusterKey: result.new_cluster_key, geneName: null })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -1045,6 +1232,22 @@ export const useStore = create<StoreState>((set, get) => ({
     } catch (error) {
       set({
         geneCatalog: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  async loadGlobalGenes() {
+    try {
+      const globalGeneCatalog = await api.getGlobalGenes(get().apiBase)
+      set((state) => ({
+        globalGeneCatalog,
+        selectedGenes: state.selectedGenes.filter((gene) => globalGeneCatalog.genes.includes(gene)),
+        dotplotResult: undefined
+      }))
+    } catch (error) {
+      set({
+        globalGeneCatalog: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -1118,7 +1321,7 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ error: 'Select at least one target cluster for marker discovery.' })
       return
     }
-    set({ busy: true, error: undefined, markerDiscoveryResult: undefined })
+    set({ busy: true, busyMessage: 'Discovering markers', error: undefined, markerDiscoveryResult: undefined })
     try {
       const result = await api.discoverMarkers(get().apiBase, selectedObjectId, {
         cluster_key: clusterKey,
@@ -1129,89 +1332,177 @@ export const useStore = create<StoreState>((set, get) => ({
       set((state) => ({
         markerDiscoveryResult: result,
         selectedGenes: [...state.selectedGenes, ...result.candidate_genes.filter((gene) => !state.selectedGenes.includes(gene))],
-        busy: false
+        busy: false,
+        busyMessage: undefined
       }))
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
   async colorBySelectedGene() {
-    const { selectedGenes, selectedObjectId, points, geneColorGene, colorMode } = get()
+    const {
+      selectedGenes,
+      selectedObjectId,
+      points,
+      geneColorGene,
+      colorMode,
+      activeViewMode,
+      globalBasePoints,
+      globalPoints,
+      globalGeneColorGene,
+      globalColorMode
+    } = get()
     if (selectedGenes.length !== 1) {
       set({ error: 'Check exactly one gene to color the UMAP by expression.' })
       return
     }
     const gene = selectedGenes[0]
-    if (!selectedObjectId) {
+    if (activeViewMode === 'lineage' && !selectedObjectId) {
       set({ error: 'Select an object first.' })
       return
     }
-    if (colorMode === 'gene' && geneColorGene === gene && points.every((point) => point.gene_expression != null)) {
+    if (
+      activeViewMode === 'lineage' &&
+      colorMode === 'gene' &&
+      geneColorGene === gene &&
+      points.every((point) => point.gene_expression != null)
+    ) {
       set({ colorMode: 'gene' })
       return
     }
-    set({ busy: true, error: undefined })
+    if (
+      activeViewMode === 'global' &&
+      globalColorMode === 'gene' &&
+      globalGeneColorGene === gene &&
+      globalBasePoints.every((point) => point.gene_expression != null)
+    ) {
+      set({ globalColorMode: 'gene' })
+      return
+    }
+    set({ busy: true, busyMessage: 'Loading gene colors', error: undefined })
     try {
-      const response = await api.getGeneExpression(get().apiBase, selectedObjectId, {
-        gene_name: gene,
-        indices: points.map((point) => point.index)
-      })
-      const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
-      set((state) => ({
-        points: state.points.map((point) => ({
+      if (activeViewMode === 'global') {
+        const basePoints = globalBasePoints.length > 0 ? globalBasePoints : globalPoints
+        const response = await api.getGlobalGeneExpression(get().apiBase, {
+          gene_name: gene,
+          indices: basePoints.map((point) => point.index)
+        })
+        const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
+        const nextPoints = basePoints.map((point) => ({
           ...point,
-          gene_expression: expressionMap.get(point.index) ?? 0
-        })),
-        colorMode: 'gene',
-        geneColorGene: gene,
-        busy: false
-      }))
+          gene_expression: expressionMap.get(point.index) ?? 0,
+          is_highlighted: undefined
+        }))
+        set({
+          globalBasePoints: nextPoints,
+          globalPoints: nextPoints,
+          globalHighlight: undefined,
+          globalColorMode: 'gene',
+          globalGeneColorGene: gene,
+          busy: false,
+          busyMessage: undefined
+        })
+      } else {
+        const response = await api.getGeneExpression(get().apiBase, selectedObjectId, {
+          gene_name: gene,
+          indices: points.map((point) => point.index)
+        })
+        const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
+        set((state) => ({
+          points: state.points.map((point) => ({
+            ...point,
+            gene_expression: expressionMap.get(point.index) ?? 0
+          })),
+          colorMode: 'gene',
+          geneColorGene: gene,
+          busy: false,
+          busyMessage: undefined
+        }))
+      }
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
   async previewDotplot() {
-    const { selectedObjectId, clusterKey, selectedGenes } = get()
-    if (!selectedObjectId || !clusterKey) {
+    const { selectedObjectId, clusterKey, selectedGenes, activeViewMode, globalClusterKey } = get()
+    if (activeViewMode === 'lineage' && (!selectedObjectId || !clusterKey)) {
       set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (activeViewMode === 'global' && !globalClusterKey) {
+      set({ error: 'Select a global cluster key first.' })
       return
     }
     if (selectedGenes.length === 0) {
       set({ error: 'Check at least one gene for the dotplot.' })
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Rendering dotplot', error: undefined })
     try {
-      const dotplotResult = await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
-        cluster_key: clusterKey,
-        genes: selectedGenes,
-        save_to_object_dir: false
-      })
-      set({ dotplotResult, busy: false })
+      const dotplotResult =
+        activeViewMode === 'global'
+          ? await api.getGlobalMarkerDotplot(get().apiBase, {
+              cluster_key: globalClusterKey,
+              genes: selectedGenes,
+              save_to_object_dir: false
+            })
+          : await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
+              cluster_key: clusterKey,
+              genes: selectedGenes,
+              save_to_object_dir: false
+            })
+      set({ dotplotResult, busy: false, busyMessage: undefined })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
   async saveDotplot() {
-    const { selectedObjectId, clusterKey, selectedGenes } = get()
-    if (!selectedObjectId || !clusterKey) {
+    const { selectedObjectId, clusterKey, selectedGenes, activeViewMode, globalClusterKey } = get()
+    if (activeViewMode === 'lineage' && (!selectedObjectId || !clusterKey)) {
       set({ error: 'Select an object and cluster key first.' })
+      return
+    }
+    if (activeViewMode === 'global' && !globalClusterKey) {
+      set({ error: 'Select a global cluster key first.' })
       return
     }
     if (selectedGenes.length === 0) {
       set({ error: 'Check at least one gene for the dotplot.' })
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Saving dotplot', error: undefined })
     try {
-      const dotplotResult = await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
-        cluster_key: clusterKey,
-        genes: selectedGenes,
-        save_to_object_dir: true
-      })
-      set({ dotplotResult, busy: false })
+      const dotplotResult =
+        activeViewMode === 'global'
+          ? await api.getGlobalMarkerDotplot(get().apiBase, {
+              cluster_key: globalClusterKey,
+              genes: selectedGenes,
+              save_to_object_dir: true
+            })
+          : await api.getMarkerDotplot(get().apiBase, selectedObjectId, {
+              cluster_key: clusterKey,
+              genes: selectedGenes,
+              save_to_object_dir: true
+            })
+      set({ dotplotResult, busy: false, busyMessage: undefined })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -1243,7 +1534,14 @@ export const useStore = create<StoreState>((set, get) => ({
     }
 
     const sessionId = randomSessionId()
-    set({ busy: true, error: undefined, sessionId, saveResult: undefined, propagationResult: undefined })
+    set({
+      busy: true,
+      busyMessage: 'Propagating labels',
+      error: undefined,
+      sessionId,
+      saveResult: undefined,
+      propagationResult: undefined
+    })
     try {
       let sessionSummary: SessionSummary | undefined
       for (const polygon of activePolygons) {
@@ -1276,10 +1574,15 @@ export const useStore = create<StoreState>((set, get) => ({
         sessionSummary,
         propagationResult,
         colorMode: 'annotation',
-        busy: false
+        busy: false,
+        busyMessage: undefined
       })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -1302,12 +1605,16 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ error: 'Run propagation before saving.' })
       return
     }
-    set({ busy: true, error: undefined })
+    set({ busy: true, busyMessage: 'Saving reannotated object', error: undefined })
     try {
       const saveResult = await api.save(get().apiBase, selectedObjectId, { session_id: sessionId })
-      set({ saveResult, busy: false })
+      set({ saveResult, busy: false, busyMessage: undefined })
     } catch (error) {
-      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
   },
 
@@ -1342,6 +1649,7 @@ export const useStore = create<StoreState>((set, get) => ({
     set({
       polygons: [],
       draftVertices: [],
+      draftPolygonId: undefined,
       isDrawing: false,
       sessionId: randomSessionId(),
       sessionSummary: undefined,
@@ -1349,6 +1657,14 @@ export const useStore = create<StoreState>((set, get) => ({
       saveResult: undefined,
       colorMode: 'cluster',
       error: undefined
+    })
+  },
+  stopCurrentTask() {
+    abortActiveRequests()
+    set({
+      busy: false,
+      busyMessage: undefined,
+      error: 'Stopped current request.'
     })
   }
 }))

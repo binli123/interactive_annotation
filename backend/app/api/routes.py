@@ -45,6 +45,8 @@ from app.schemas.api import (
     ScanFolderRequest,
     SessionSummaryResponse,
     SeedLabelsRequest,
+    VisibleHighlightRequest,
+    VisibleHighlightResponse,
     UmapRequest,
     UmapResponse,
 )
@@ -186,6 +188,7 @@ def global_umap(request: UmapRequest) -> UmapResponse:
             gene_name=request.gene_name,
             max_points=request.max_points,
             min_per_cluster=request.min_per_cluster,
+            max_per_cluster=request.max_per_cluster,
             random_seed=request.random_seed,
         )
     except ValueError as exc:
@@ -210,6 +213,7 @@ def global_highlight_from_object(request: HighlightGlobalRequest) -> UmapRespons
             highlight_cell_ids=highlight_cell_ids,
             max_points=request.max_points,
             min_per_cluster=request.min_per_cluster,
+            max_per_cluster=request.max_per_cluster,
             random_seed=request.random_seed,
         )
     except ValueError as exc:
@@ -217,9 +221,45 @@ def global_highlight_from_object(request: HighlightGlobalRequest) -> UmapRespons
     return UmapResponse(**payload)
 
 
+@router.post("/global/highlight-visible-from-object", response_model=VisibleHighlightResponse)
+def global_highlight_visible_from_object(request: VisibleHighlightRequest) -> VisibleHighlightResponse:
+    source_record = _resolve_record(request.source_object_id)
+    global_record = _global_record()
+    try:
+        highlight_cell_ids = adata_service.get_cluster_cell_ids(
+            record=source_record,
+            cluster_key=request.source_cluster_key,
+            cluster_id=request.source_cluster_id,
+        )
+        payload = adata_service.get_visible_highlight_values(
+            record=global_record,
+            highlight_cell_ids=highlight_cell_ids,
+            indices=request.indices,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return VisibleHighlightResponse(**payload)
+
+
 @router.post("/objects/{object_id}/gene-expression", response_model=GeneExpressionResponse)
 def object_gene_expression(object_id: str, request: GeneExpressionRequest) -> GeneExpressionResponse:
     record = _resolve_record(object_id)
+    try:
+        payload = adata_service.get_gene_expression_values(record, request.gene_name, request.indices)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return GeneExpressionResponse(**payload)
+
+
+@router.get("/global/genes", response_model=GeneCatalogResponse)
+def global_genes() -> GeneCatalogResponse:
+    record = _global_record()
+    return GeneCatalogResponse(**adata_service.get_gene_catalog(record))
+
+
+@router.post("/global/gene-expression", response_model=GeneExpressionResponse)
+def global_gene_expression(request: GeneExpressionRequest) -> GeneExpressionResponse:
+    record = _global_record()
     try:
         payload = adata_service.get_gene_expression_values(record, request.gene_name, request.indices)
     except ValueError as exc:
@@ -305,6 +345,7 @@ def umap_points(object_id: str, request: UmapRequest) -> UmapResponse:
             gene_name=request.gene_name,
             max_points=request.max_points,
             min_per_cluster=request.min_per_cluster,
+            max_per_cluster=request.max_per_cluster,
             random_seed=request.random_seed,
         )
     except ValueError as exc:
@@ -315,6 +356,22 @@ def umap_points(object_id: str, request: UmapRequest) -> UmapResponse:
 @router.post("/objects/{object_id}/marker-dotplot", response_model=DotplotResponse)
 def marker_dotplot(object_id: str, request: DotplotRequest) -> DotplotResponse:
     record = _resolve_record(object_id)
+    try:
+        payload = adata_service.render_marker_dotplot(
+            record=record,
+            cluster_key=request.cluster_key,
+            genes=request.genes,
+            save_to_object_dir=request.save_to_object_dir,
+            output_name=request.output_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DotplotResponse(**payload)
+
+
+@router.post("/global/marker-dotplot", response_model=DotplotResponse)
+def global_marker_dotplot(request: DotplotRequest) -> DotplotResponse:
+    record = _global_record()
     try:
         payload = adata_service.render_marker_dotplot(
             record=record,

@@ -84,18 +84,20 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
     points: mode === 'lineage' ? store.points : store.globalPoints,
     polygons: mode === 'lineage' ? store.polygons : [],
     draftVertices: mode === 'lineage' ? store.draftVertices : [],
+    draftPolygonId: mode === 'lineage' ? store.draftPolygonId : undefined,
     isDrawing: mode === 'lineage' ? store.isDrawing : false,
     startDrawing: store.startDrawing,
     stopDrawing: store.stopDrawing,
     addDraftVertex: store.addDraftVertex,
+    updateDraftVertex: store.updateDraftVertex,
     undoDraftVertex: store.undoDraftVertex,
     finalizeDraftPolygon: store.finalizeDraftPolygon,
     clearDraftPolygon: store.clearDraftPolygon,
     clearPolygons: store.clearPolygons,
     propagationResult: mode === 'lineage' ? store.propagationResult : undefined,
-    colorMode: mode === 'lineage' ? store.colorMode : 'cluster',
+    colorMode: mode === 'lineage' ? store.colorMode : store.globalColorMode,
     clusterVisibility: mode === 'lineage' ? store.clusterVisibility : {},
-    geneColorGene: mode === 'lineage' ? store.geneColorGene : undefined,
+    geneColorGene: mode === 'lineage' ? store.geneColorGene : store.globalGeneColorGene,
     pointSize: store.pointSize,
     pointOpacity: store.pointOpacity,
     paletteName: store.paletteName,
@@ -120,6 +122,7 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
   const flipCenter = fit.target
   const [viewState, setViewState] = useState<{ target: number[]; zoom: number }>(fit)
   const [frameSize, setFrameSize] = useState({ width: 1, height: 1 })
+  const [draggingVertexIndex, setDraggingVertexIndex] = useState<number | null>(null)
 
   useEffect(() => {
     setViewState(fit)
@@ -182,13 +185,15 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
 
   const displayPolygons: RenderPolygon[] = useMemo(
     () =>
-      state.polygons.map((polygon) => ({
-        ...polygon,
-        displayVertices: polygon.vertices.map((vertex) =>
-          transformVertex(vertex, flipCenter, state.flipHorizontal, state.flipVertical)
-        )
-      })),
-    [flipCenter, state.flipHorizontal, state.flipVertical, state.polygons]
+      state.polygons
+        .filter((polygon) => polygon.id !== state.draftPolygonId)
+        .map((polygon) => ({
+          ...polygon,
+          displayVertices: polygon.vertices.map((vertex) =>
+            transformVertex(vertex, flipCenter, state.flipHorizontal, state.flipVertical)
+          )
+        })),
+    [flipCenter, state.draftPolygonId, state.flipHorizontal, state.flipVertical, state.polygons]
   )
 
   const pointLayer = useMemo(
@@ -203,7 +208,7 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
         pickable: true,
         opacity: state.pointOpacity,
         getFillColor: (point: any) => {
-          if (mode === 'global' && state.globalHighlight) {
+          if (mode === 'global' && state.globalHighlight && state.colorMode !== 'gene') {
             if (point.is_highlighted) {
               const [r, g, b] = colorForKey(state.globalHighlight.sourceClusterId, state.paletteName)
               return [r, g, b, 255]
@@ -299,7 +304,7 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
           {mode === 'lineage' ? (
             <>
               <button className="button" onClick={state.isDrawing ? state.stopDrawing : state.startDrawing}>
-                {state.isDrawing ? 'Stop drawing' : 'Draw polygon'}
+                {state.isDrawing ? (state.draftPolygonId ? 'Stop editing' : 'Stop drawing') : 'Draw polygon'}
               </button>
               <button
                 className="button"
@@ -328,7 +333,9 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
           {mode === 'lineage' ? (
             <>
               Displayed points: {visibleBasePoints.length}
-              {state.isDrawing ? ` | Draft points: ${state.draftVertices.length}` : ''}
+              {state.isDrawing
+                ? ` | ${state.draftPolygonId ? 'Editing' : 'Draft'} points: ${state.draftVertices.length}`
+                : ''}
               {state.propagationResult ? ` | Propagated cells: ${state.propagationResult.n_assigned_cells}` : ''}
               {state.colorMode === 'gene' && state.geneColorGene ? ` | Gene: ${state.geneColorGene}` : ''}
             </>
@@ -387,6 +394,9 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
                 if (!state.isDrawing) {
                   return
                 }
+                if (draggingVertexIndex !== null) {
+                  return
+                }
                 const rect = event.currentTarget.getBoundingClientRect()
                 const x = event.clientX - rect.left
                 const y = event.clientY - rect.top
@@ -399,6 +409,24 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
                 )
                 state.addDraftVertex([Number(nextVertex[0]), Number(nextVertex[1])])
               }}
+              onPointerMove={(event) => {
+                if (draggingVertexIndex === null) {
+                  return
+                }
+                const rect = event.currentTarget.getBoundingClientRect()
+                const x = event.clientX - rect.left
+                const y = event.clientY - rect.top
+                const movedVertex = viewport.unproject([x, y]) as number[]
+                const nextVertex = transformVertex(
+                  movedVertex,
+                  flipCenter,
+                  state.flipHorizontal,
+                  state.flipVertical
+                )
+                state.updateDraftVertex(draggingVertexIndex, [Number(nextVertex[0]), Number(nextVertex[1])])
+              }}
+              onPointerUp={() => setDraggingVertexIndex(null)}
+              onPointerLeave={() => setDraggingVertexIndex(null)}
               onDoubleClick={() => {
                 if (state.isDrawing && state.draftVertices.length >= 3) {
                   void state.finalizeDraftPolygon()
@@ -423,6 +451,10 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
                       fill="#fffdfa"
                       stroke="#182126"
                       strokeWidth={String(Math.max(1, state.polygonStrokeWidth))}
+                      onPointerDown={(event) => {
+                        event.stopPropagation()
+                        setDraggingVertexIndex(index)
+                      }}
                     />
                   ))}
                 </>

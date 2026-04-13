@@ -127,7 +127,8 @@ textarea {
 }
 
 .button-row,
-.two-col {
+.two-col,
+.three-col {
   display: grid;
   gap: 10px;
 }
@@ -144,6 +145,10 @@ textarea {
 
 .two-col {
   grid-template-columns: 1fr 1fr;
+}
+
+.three-col {
+  grid-template-columns: 1fr 1fr 1fr;
 }
 
 .button {
@@ -542,6 +547,10 @@ textarea {
   }
 
   .canvas-buttons {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .three-col {
     grid-template-columns: 1fr 1fr;
   }
 

@@ -228,12 +228,14 @@ class AnnDataService:
     def __init__(self, max_cached_objects: int = settings.max_cached_objects) -> None:
         self.max_cached_objects = max_cached_objects
         self._cache: OrderedDict[str, ad.AnnData] = OrderedDict()
+        self._cell_id_cache: dict[str, np.ndarray] = {}
 
     def _touch(self, object_id: str, adata: ad.AnnData) -> ad.AnnData:
         self._cache[object_id] = adata
         self._cache.move_to_end(object_id)
         while len(self._cache) > self.max_cached_objects:
-            _, evicted = self._cache.popitem(last=False)
+            evicted_object_id, evicted = self._cache.popitem(last=False)
+            self._cell_id_cache.pop(evicted_object_id, None)
             if getattr(evicted, "isbacked", False):
                 evicted.file.close()
         return adata
@@ -242,6 +244,7 @@ class AnnDataService:
         cached = self._cache.pop(object_id, None)
         if cached is not None and getattr(cached, "isbacked", False):
             cached.file.close()
+        self._cell_id_cache.pop(object_id, None)
         return self._touch(object_id, adata)
 
     def get_adata(self, record: ObjectRecord) -> ad.AnnData:
@@ -262,6 +265,20 @@ class AnnDataService:
         cached = self._cache.pop(object_id, None)
         if cached is not None and getattr(cached, "isbacked", False):
             cached.file.close()
+        self._cell_id_cache.pop(object_id, None)
+
+    def _get_cell_ids(self, record: ObjectRecord) -> np.ndarray:
+        cached = self._cell_id_cache.get(record.object_id)
+        if cached is not None:
+            return cached
+        adata = self.get_adata(record)
+        if "cell_id" in adata.obs.columns:
+            cell_ids = _obs_to_str_array(adata.obs, "cell_id")
+        else:
+            cell_ids = adata.obs_names.to_numpy(dtype=object)
+        normalized = np.asarray(cell_ids, dtype=object).astype(str, copy=False)
+        self._cell_id_cache[record.object_id] = normalized
+        return normalized
 
     def _move_undo_dir(self) -> Path:
         path = settings.project_root / ".move_undo"
@@ -568,10 +585,7 @@ class AnnDataService:
         highlight_mask: np.ndarray | None = None,
     ) -> dict[str, Any]:
         obs_frame = adata.obs.iloc[indices]
-        if "cell_id" in adata.obs.columns:
-            cell_ids = _obs_to_str_array(adata.obs, "cell_id")[indices]
-        else:
-            cell_ids = adata.obs_names.to_numpy(dtype=object)[indices]
+        cell_ids = self._get_cell_ids(record)[indices]
 
         label_column = next(
             (
@@ -639,6 +653,7 @@ class AnnDataService:
         gene_name: str | None,
         max_points: int,
         min_per_cluster: int,
+        max_per_cluster: int,
         random_seed: int,
     ) -> dict[str, Any]:
         adata = self.get_adata(record)
@@ -652,6 +667,7 @@ class AnnDataService:
             labels=clusters.astype(str),
             max_points=max_points,
             min_per_cluster=min_per_cluster,
+            max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
             random_seed=random_seed,
         )
         payload = self._point_payload(
@@ -681,6 +697,7 @@ class AnnDataService:
         highlight_cell_ids: set[str],
         max_points: int,
         min_per_cluster: int,
+        max_per_cluster: int,
         random_seed: int,
     ) -> dict[str, Any]:
         adata = self.get_adata(record)
@@ -690,17 +707,14 @@ class AnnDataService:
             if cluster_key
             else np.full(adata.n_obs, "all", dtype=object)
         )
-        cell_ids = (
-            _obs_to_str_array(adata.obs, "cell_id")
-            if "cell_id" in adata.obs.columns
-            else adata.obs_names.to_numpy(dtype=object)
-        )
-        highlight_mask = np.isin(cell_ids.astype(str), list(highlight_cell_ids))
+        cell_ids = self._get_cell_ids(record)
+        highlight_mask = np.isin(cell_ids, list(highlight_cell_ids))
         indices = priority_stratified_sample_indices(
             labels=clusters.astype(str),
             priority_mask=highlight_mask,
             max_points=max_points,
             min_per_cluster=min_per_cluster,
+            max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
             random_seed=random_seed,
         )
         payload = self._point_payload(
@@ -1068,12 +1082,37 @@ class AnnDataService:
         mask = cluster_values.astype(str) == str(cluster_id)
         if not bool(mask.any()):
             raise ValueError(f"Cluster not found in {cluster_key}: {cluster_id}")
-        cell_ids = (
-            _obs_to_str_array(adata.obs, "cell_id")[mask]
-            if "cell_id" in adata.obs.columns
-            else adata.obs_names.to_numpy(dtype=object)[mask]
-        )
+        cell_ids = self._get_cell_ids(record)[mask]
         return {str(cell_id) for cell_id in cell_ids.tolist()}
+
+    def get_visible_highlight_values(
+        self,
+        record: ObjectRecord,
+        highlight_cell_ids: set[str],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        cell_ids = self._get_cell_ids(record)
+        index_array = np.asarray(indices, dtype=int)
+        if index_array.size == 0:
+            return {
+                "object_id": record.object_id,
+                "highlighted_total": int(len(highlight_cell_ids)),
+                "highlighted_displayed": 0,
+                "values": [],
+            }
+        if int(index_array.min()) < 0 or int(index_array.max()) >= cell_ids.shape[0]:
+            raise ValueError("Requested point indices are out of bounds for the current object.")
+
+        visible_mask = np.isin(cell_ids[index_array], list(highlight_cell_ids))
+        return {
+            "object_id": record.object_id,
+            "highlighted_total": int(len(highlight_cell_ids)),
+            "highlighted_displayed": int(visible_mask.sum()),
+            "values": [
+                {"index": int(index), "is_highlighted": bool(is_highlighted)}
+                for index, is_highlighted in zip(index_array.tolist(), visible_mask.tolist(), strict=False)
+            ],
+        }
 
     def _prepare_concat_frames(self, source: ad.AnnData, dest: ad.AnnData) -> tuple[ad.AnnData, ad.AnnData]:
         obs_columns = list(dict.fromkeys(list(dest.obs.columns) + list(source.obs.columns)))

@@ -8,16 +8,21 @@ import UmapCanvas from './components/UmapCanvas'
 import { useStore } from './app/store'
 
 export default function App() {
-  const { scanFolder, loadGlobalMetadata, metadata, busy, error, activeViewMode, setActiveViewMode, globalHighlight } = useStore((state) => ({
+  const { scanFolder, loadGlobalMetadata, metadata, globalMetadata, busy, busyMessage, error, activeViewMode, setActiveViewMode, globalHighlight, stopCurrentTask } = useStore((state) => ({
     scanFolder: state.scanFolder,
     loadGlobalMetadata: state.loadGlobalMetadata,
     metadata: state.metadata,
+    globalMetadata: state.globalMetadata,
     busy: state.busy,
+    busyMessage: state.busyMessage,
     error: state.error,
     activeViewMode: state.activeViewMode,
     setActiveViewMode: state.setActiveViewMode,
-    globalHighlight: state.globalHighlight
+    globalHighlight: state.globalHighlight,
+    stopCurrentTask: state.stopCurrentTask
   }))
+
+  const activeMetadata = activeViewMode === 'global' ? globalMetadata : metadata
 
   useEffect(() => {
     void scanFolder()
@@ -35,13 +40,18 @@ export default function App() {
           <div>
             <h1>Interactive Lineage Reannotation</h1>
             <p className="muted">
-              {metadata
-                ? `${metadata.lineage_name} | ${metadata.shape[0].toLocaleString()} cells | ${metadata.shape[1].toLocaleString()} genes`
+              {activeMetadata
+                ? `${activeMetadata.lineage_name} | ${activeMetadata.shape[0].toLocaleString()} cells | ${activeMetadata.shape[1].toLocaleString()} genes`
                 : 'Load a lineage object to begin.'}
             </p>
           </div>
           <div className="status-row">
-            {busy ? <span className="status-pill">Working</span> : null}
+            {busy ? <span className="status-pill">{busyMessage ? `Working: ${busyMessage}` : 'Working'}</span> : null}
+            {busy ? (
+              <button className="button button-secondary button-inline" onClick={stopCurrentTask}>
+                Stop
+              </button>
+            ) : null}
             {globalHighlight ? <span className="status-pill">Global highlight active</span> : null}
             {error ? <span className="status-pill status-error">{error}</span> : null}
           </div>

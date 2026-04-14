@@ -47,7 +47,32 @@ textarea {
   min-width: 0;
   min-height: 0;
   gap: 14px;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(31, 91, 113, 0.55) rgba(24, 33, 38, 0.08);
+}
+
+.main-stage::-webkit-scrollbar {
+  width: 10px;
+}
+
+.main-stage::-webkit-scrollbar-track {
+  background: rgba(24, 33, 38, 0.08);
+  border-radius: 999px;
+}
+
+.main-stage::-webkit-scrollbar-thumb {
+  background: rgba(31, 91, 113, 0.55);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.main-stage::-webkit-scrollbar-thumb:hover {
+  background: rgba(31, 91, 113, 0.75);
+  background-clip: padding-box;
 }
 
 .stage-header {
@@ -128,7 +153,8 @@ textarea {
 
 .button-row,
 .two-col,
-.three-col {
+.three-col,
+.sampling-grid {
   display: grid;
   gap: 10px;
 }
@@ -149,6 +175,23 @@ textarea {
 
 .three-col {
   grid-template-columns: 1fr 1fr 1fr;
+}
+
+.sampling-grid {
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 12px;
+}
+
+.sampling-grid .field {
+  margin-bottom: 0;
+}
+
+.sampling-grid .field span {
+  line-height: 1.15;
+}
+
+.sampling-wide {
+  grid-column: 1 / -1;
 }
 
 .button {
@@ -552,6 +595,14 @@ textarea {
 
   .three-col {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .sampling-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sampling-wide {
+    grid-column: auto;
   }
 
   .cluster-label-header {

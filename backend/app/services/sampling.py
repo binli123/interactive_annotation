@@ -36,9 +36,14 @@ def stratified_sample_indices(
 
     label_values, inverse = np.unique(labels, return_inverse=True)
     counts = np.bincount(inverse)
+    effective_cap: int | None = None
+    if max_per_cluster is not None and int(max_per_cluster) > 0:
+        effective_cap = int(max_per_cluster)
+        if int(min_per_cluster) > 0:
+            effective_cap = max(effective_cap, int(min_per_cluster))
     capped_counts = (
-        np.minimum(counts, int(max_per_cluster))
-        if max_per_cluster is not None and int(max_per_cluster) > 0
+        np.minimum(counts, effective_cap)
+        if effective_cap is not None and effective_cap > 0
         else counts.astype(int, copy=True)
     )
 

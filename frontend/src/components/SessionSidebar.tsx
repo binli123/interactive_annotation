@@ -157,9 +157,9 @@ export default function SessionSidebar() {
                 ))}
               </select>
             </label>
-            <div className="three-col">
-              <label className="field">
-                <span>Max points</span>
+            <div className="sampling-grid">
+              <label className="field sampling-wide">
+                <span>Overall max points</span>
                 <input
                   type="number"
                   value={state.maxPoints}
@@ -170,12 +170,13 @@ export default function SessionSidebar() {
                 <span>Min/cluster</span>
                 <input
                   type="number"
+                  min="0"
                   value={state.minPerCluster}
                   onChange={(event) => state.setMinPerCluster(Number(event.target.value))}
                 />
               </label>
               <label className="field">
-                <span>Max/cluster</span>
+                <span>Cluster-wise cap</span>
                 <input
                   type="number"
                   min="0"
@@ -260,9 +261,9 @@ export default function SessionSidebar() {
                 ))}
               </select>
             </label>
-            <div className="three-col">
-              <label className="field">
-                <span>Max points</span>
+            <div className="sampling-grid">
+              <label className="field sampling-wide">
+                <span>Overall max points</span>
                 <input
                   type="number"
                   value={state.globalMaxPoints}
@@ -273,12 +274,13 @@ export default function SessionSidebar() {
                 <span>Min/cluster</span>
                 <input
                   type="number"
+                  min="0"
                   value={state.globalMinPerCluster}
                   onChange={(event) => state.setGlobalMinPerCluster(Number(event.target.value))}
                 />
               </label>
               <label className="field">
-                <span>Max/cluster</span>
+                <span>Cluster-wise cap</span>
                 <input
                   type="number"
                   min="0"

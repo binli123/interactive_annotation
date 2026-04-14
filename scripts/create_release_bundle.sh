@@ -14,6 +14,7 @@ mkdir -p "$STAGING_DIR/frontend/src" "$STAGING_DIR/frontend/public" "$STAGING_DI
 cp "$ROOT_DIR/docker-compose.yml" "$STAGING_DIR/"
 cp "$ROOT_DIR/Makefile" "$STAGING_DIR/"
 cp "$ROOT_DIR/README.md" "$STAGING_DIR/"
+cp "$ROOT_DIR/DOCKER_UPDATE_GUIDE.md" "$STAGING_DIR/"
 cp "$ROOT_DIR/.dockerignore" "$STAGING_DIR/"
 cp -R "$ROOT_DIR/sample_data/." "$STAGING_DIR/sample_data"
 mkdir -p "$STAGING_DIR/backend"

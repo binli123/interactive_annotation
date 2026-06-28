@@ -33,6 +33,7 @@ class MetadataResponse(BaseModel):
     default_cluster_key: str | None = None
     has_connectivities: bool
     has_distances: bool
+    has_spatial: bool = False
     summary_resolution_trials: list[dict[str, Any]] = Field(default_factory=list)
     obs_columns: list[str] = Field(default_factory=list)
     sample_columns: list[str] = Field(default_factory=list)
@@ -63,6 +64,8 @@ class UmapPoint(BaseModel):
     current_score: float | None = None
     gene_expression: float | None = None
     is_highlighted: bool | None = None
+    sx: float | None = None
+    sy: float | None = None
 
 
 class UmapResponse(BaseModel):
@@ -414,3 +417,141 @@ class MoveClusterUndoResponse(BaseModel):
     n_moved_cells: int
     n_overwritten_cells: int
     created_at: str
+
+
+class ObjectChangeUndoStatusResponse(BaseModel):
+    available: bool
+    change_type: str | None = None
+    description: str | None = None
+    object_ids: list[str] = Field(default_factory=list)
+    object_paths: list[str] = Field(default_factory=list)
+    object_count: int | None = None
+    created_at: str | None = None
+
+
+class ObjectChangeUndoResponse(BaseModel):
+    available: bool
+    restored: bool
+    change_type: str
+    description: str
+    object_ids: list[str] = Field(default_factory=list)
+    object_paths: list[str] = Field(default_factory=list)
+    object_count: int
+    created_at: str
+
+
+# F-04 / F-13 — Obs metadata coloring & QC
+
+class ObsValuesRequest(BaseModel):
+    column: str
+    indices: list[int] = Field(default_factory=list)
+
+
+class ObsColumnMeta(BaseModel):
+    name: str
+    dtype: str
+    is_numeric: bool
+    is_qc: bool = False
+    n_unique: int | None = None
+
+
+class ObsColumnsResponse(BaseModel):
+    object_id: str
+    columns: list[ObsColumnMeta]
+
+
+class ObsValueItem(BaseModel):
+    index: int
+    value: float | str | None
+
+
+class ObsValuesResponse(BaseModel):
+    object_id: str
+    column: str
+    dtype: str
+    is_numeric: bool
+    values: list[ObsValueItem]
+
+
+# F-08 — Differential expression
+
+class DERequest(BaseModel):
+    cluster_key: str
+    target_clusters: list[str] = Field(default_factory=list)
+    reference_clusters: list[str] = Field(default_factory=list)
+    top_n: int = Field(default=50, ge=1, le=500)
+    method: Literal["wilcoxon", "t-test"] = "wilcoxon"
+
+
+class DEGene(BaseModel):
+    gene_name: str
+    log_fold_change: float
+    p_val_adj: float
+    p_val: float
+    mean_target: float
+    mean_reference: float
+
+
+class DEResponse(BaseModel):
+    object_id: str
+    cluster_key: str
+    target_clusters: list[str]
+    reference_clusters: list[str]
+    n_target_cells: int
+    n_reference_cells: int
+    method: str
+    genes: list[DEGene]
+
+
+# F-15 — Annotation diff
+
+class AnnotationDiffRequest(BaseModel):
+    key_a: str
+    key_b: str
+
+
+class AnnotationDiffTransition(BaseModel):
+    label_a: str
+    label_b: str
+    count: int
+
+
+class AnnotationDiffResponse(BaseModel):
+    object_id: str
+    key_a: str
+    key_b: str
+    total_cells: int
+    changed_cells: int
+    unchanged_cells: int
+    transitions: list[AnnotationDiffTransition]
+    changed_indices: list[int]
+
+
+# F-03 — Persistent session
+
+class LiveSessionResponse(BaseModel):
+    object_id: str
+    available: bool
+    session_id: str | None = None
+    n_seed_cells: int | None = None
+    n_polygons: int | None = None
+    labels: dict[str, int] | None = None
+    embedding_key: str | None = None
+    cluster_key: str | None = None
+    has_propagation: bool | None = None
+
+
+# F-10 — Project dashboard
+
+class ObjectAnnotationCoverage(BaseModel):
+    object_id: str
+    lineage_name: str
+    n_cells: int | None = None
+    n_annotated: int | None = None
+    annotation_fraction: float | None = None
+    annotation_column: str | None = None
+    n_clusters: int | None = None
+
+
+# F-09 — Export (response is a streaming file; no Pydantic model needed for body)
+# Route returns a StreamingResponse / FileResponse directly

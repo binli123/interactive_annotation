@@ -9,9 +9,12 @@ def _path_env(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
+_default_project_root = Path(__file__).resolve().parents[3]
+
+
 @dataclass(frozen=True)
 class Settings:
-    project_root: Path = _path_env("INTERACTIVE_ANNOTATION_PROJECT_ROOT", "/app")
+    project_root: Path = _path_env("INTERACTIVE_ANNOTATION_PROJECT_ROOT", str(_default_project_root))
     default_data_root: Path = _path_env("INTERACTIVE_ANNOTATION_DATA_ROOT", "/data")
     default_lineage_root: Path = _path_env(
         "INTERACTIVE_ANNOTATION_LINEAGE_ROOT",

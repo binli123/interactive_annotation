@@ -1,16 +1,24 @@
 import { create } from 'zustand'
 import { abortActiveRequests, api } from './api'
 import type {
+  AnnotationDiffResponse,
   ClusterLabelEditorResponse,
+  DEResponse,
   DotplotResponse,
   GeneCatalogResponse,
+  LiveSessionResponse,
   MarkerDiscoveryResponse,
   MetadataResponse,
   MoveClusterPreviewResponse,
   MoveClusterResponse,
   MoveClusterUndoResponse,
   MoveClusterUndoStatusResponse,
+  ObjectAnnotationCoverage,
+  ObjectChangeUndoResponse,
+  ObjectChangeUndoStatusResponse,
   ObjectCard,
+  ObsColumnMeta,
+  ObsValuesResponse,
   PaletteName,
   PolygonRecord,
   PromoteReannotLabelsResponse,
@@ -91,6 +99,16 @@ function samePointSequence(left: UmapPoint[], right: UmapPoint[]): boolean {
   return true
 }
 
+function effectiveHighlightedGene(
+  selectedGenes: string[],
+  activeHighlightedGene?: string
+): string | undefined {
+  if (activeHighlightedGene && selectedGenes.includes(activeHighlightedGene)) {
+    return activeHighlightedGene
+  }
+  return selectedGenes.length === 1 ? selectedGenes[0] : undefined
+}
+
 type PropagationScope =
   | 'polygon_only'
   | 'selected_clusters_only'
@@ -136,6 +154,8 @@ export type StoreState = {
   moveClusterResult?: MoveClusterResponse
   moveClusterUndoStatus?: MoveClusterUndoStatusResponse
   moveClusterUndoResult?: MoveClusterUndoResponse
+  objectUndoStatus?: ObjectChangeUndoStatusResponse
+  objectUndoResult?: ObjectChangeUndoResponse
   polygons: PolygonRecord[]
   draftVertices: number[][]
   draftPolygonId?: string
@@ -156,6 +176,7 @@ export type StoreState = {
   sessionSummary?: SessionSummary
   propagationResult?: PropagateResponse
   saveResult?: SaveResponse
+  savePromptOpen: boolean
   promoteReannotResult?: PromoteReannotLabelsResponse
   clusterLabelEditor?: ClusterLabelEditorResponse
   clusterLabelSaveResult?: SaveClusterLabelsResponse
@@ -169,6 +190,7 @@ export type StoreState = {
   globalGeneCatalog?: GeneCatalogResponse
   geneSearch: string
   selectedGenes: string[]
+  activeHighlightedGene?: string
   favoriteGenes: string[]
   geneColorGene?: string
   globalGeneColorGene?: string
@@ -178,6 +200,21 @@ export type StoreState = {
   markerDiscoveryResult?: MarkerDiscoveryResponse
   colorMode: ColorMode
   globalColorMode: Extract<ColorMode, 'cluster' | 'gene'>
+  // F-04/F-13: obs metadata coloring
+  obsColumns?: ObsColumnMeta[]
+  activeObsColumn?: string
+  obsColorValues: Record<number, number | string | null>
+  // F-08: differential expression
+  deResult?: DEResponse
+  deTargetClusters: string[]
+  deReferenceClusters: string[]
+  // F-10: project dashboard
+  dashboardData?: ObjectAnnotationCoverage[]
+  dashboardVisible: boolean
+  // F-15: annotation diff
+  annotationDiffResult?: AnnotationDiffResponse
+  // F-03: live session restore
+  liveSessionInfo?: LiveSessionResponse
   busy: boolean
   busyMessage?: string
   error?: string
@@ -246,10 +283,13 @@ export type StoreState = {
   moveClusterToObject: (clusterId: string, destinationObjectId: string) => Promise<void>
   loadMoveClusterUndoStatus: () => Promise<void>
   undoLatestMoveCluster: () => Promise<void>
+  loadObjectUndoStatus: () => Promise<void>
+  undoLatestObjectChange: () => Promise<void>
   refreshPointClusters: (clusterKey?: string) => Promise<void>
   propagate: () => Promise<void>
   refreshSessionSummary: () => Promise<void>
   saveSession: () => Promise<void>
+  dismissSavePrompt: () => void
   resetPropagation: () => Promise<void>
   resetSession: () => Promise<void>
   loadClusterLabelEditor: () => Promise<void>
@@ -258,8 +298,10 @@ export type StoreState = {
   loadGenes: () => Promise<void>
   loadGlobalGenes: () => Promise<void>
   setGeneSearch: (value: string) => void
+  addSelectedGenes: (genes: string[]) => void
   toggleGeneSelected: (gene: string) => void
   clearSelectedGenes: () => void
+  setActiveHighlightedGene: (gene?: string) => void
   toggleFavoriteGene: (gene: string) => void
   reorderSelectedGenes: (fromIndex: number, toIndex: number) => void
   toggleMarkerDiscoveryTarget: (clusterId: string) => void
@@ -269,6 +311,26 @@ export type StoreState = {
   previewDotplot: () => Promise<void>
   saveDotplot: () => Promise<void>
   stopCurrentTask: () => void
+  // F-04/F-13
+  loadObsColumns: () => Promise<void>
+  setActiveObsColumn: (column: string | undefined) => Promise<void>
+  // F-08
+  runDifferentialExpression: () => Promise<void>
+  setDeTargetClusters: (clusters: string[]) => void
+  setDeReferenceClusters: (clusters: string[]) => void
+  toggleDeTargetCluster: (clusterId: string) => void
+  toggleDeReferenceCluster: (clusterId: string) => void
+  // F-09
+  downloadExportAnnotations: (fmt: 'csv' | 'tsv' | 'json') => void
+  // F-10
+  loadDashboard: () => Promise<void>
+  setDashboardVisible: (visible: boolean) => void
+  // F-15
+  runAnnotationDiff: (keyA: string, keyB: string) => Promise<void>
+  // F-03
+  checkLiveSession: () => Promise<void>
+  restoreLiveSession: () => Promise<void>
+  dismissLiveSession: () => Promise<void>
 }
 
 export const useStore = create<StoreState>((set, get) => ({
@@ -297,6 +359,8 @@ export const useStore = create<StoreState>((set, get) => ({
   moveClusterResult: undefined,
   moveClusterUndoStatus: undefined,
   moveClusterUndoResult: undefined,
+  objectUndoStatus: undefined,
+  objectUndoResult: undefined,
   polygons: [],
   draftVertices: [],
   draftPolygonId: undefined,
@@ -317,6 +381,7 @@ export const useStore = create<StoreState>((set, get) => ({
   sessionSummary: undefined,
   propagationResult: undefined,
   saveResult: undefined,
+  savePromptOpen: false,
   promoteReannotResult: undefined,
   clusterLabelEditor: undefined,
   clusterLabelSaveResult: undefined,
@@ -330,6 +395,7 @@ export const useStore = create<StoreState>((set, get) => ({
   globalGeneCatalog: undefined,
   geneSearch: '',
   selectedGenes: [],
+  activeHighlightedGene: undefined,
   favoriteGenes: loadFavoriteGenes(),
   geneColorGene: undefined,
   globalGeneColorGene: undefined,
@@ -339,6 +405,16 @@ export const useStore = create<StoreState>((set, get) => ({
   markerDiscoveryResult: undefined,
   colorMode: 'cluster',
   globalColorMode: 'cluster',
+  obsColumns: undefined,
+  activeObsColumn: undefined,
+  obsColorValues: {},
+  deResult: undefined,
+  deTargetClusters: [],
+  deReferenceClusters: [],
+  dashboardData: undefined,
+  dashboardVisible: false,
+  annotationDiffResult: undefined,
+  liveSessionInfo: undefined,
   busy: false,
   busyMessage: undefined,
   error: undefined,
@@ -356,6 +432,7 @@ export const useStore = create<StoreState>((set, get) => ({
       })
       await Promise.all([
         get().loadMoveClusterUndoStatus(),
+        get().loadObjectUndoStatus(),
         preferredObject?.is_valid ? get().selectObject(preferredObject.object_id) : Promise.resolve()
       ])
       if (!preferredObject?.is_valid && preferredObject) {
@@ -420,6 +497,7 @@ export const useStore = create<StoreState>((set, get) => ({
       sessionSummary: undefined,
       propagationResult: undefined,
       saveResult: undefined,
+      savePromptOpen: false,
       promoteReannotResult: undefined,
       clusterLabelEditor: undefined,
       clusterLabelSaveResult: undefined,
@@ -433,6 +511,7 @@ export const useStore = create<StoreState>((set, get) => ({
       geneCatalog: undefined,
       geneSearch: '',
       selectedGenes: [],
+      activeHighlightedGene: undefined,
       geneColorGene: undefined,
       dotplotResult: undefined,
       markerDiscoveryTargets: [],
@@ -478,15 +557,22 @@ export const useStore = create<StoreState>((set, get) => ({
           set((state) => ({
             geneCatalog,
             selectedGenes: state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+            activeHighlightedGene: effectiveHighlightedGene(
+              state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+              state.activeHighlightedGene
+            ),
             dotplotResult: undefined
           }))
         ),
-        api.getMoveClusterUndoStatus(get().apiBase).then((moveClusterUndoStatus) => set({ moveClusterUndoStatus }))
+        api.getMoveClusterUndoStatus(get().apiBase).then((moveClusterUndoStatus) => set({ moveClusterUndoStatus })),
+        api.getObjectUndoStatus(get().apiBase).then((objectUndoStatus) => set({ objectUndoStatus }))
       ])
       set({ busy: false, busyMessage: undefined })
       if (hadGlobalHighlight) {
         await get().restoreGlobalClusterColors()
       }
+      // F-03: check for persistent live session
+      void get().checkLiveSession()
     } catch (error) {
       set({
         busy: false,
@@ -618,6 +704,7 @@ export const useStore = create<StoreState>((set, get) => ({
         colorMode: 'cluster',
         busy: false
       })
+      await get().loadObjectUndoStatus()
       await get().loadClusterLabelEditor()
       await get().refreshPointClusters('reannot_label')
     } catch (error) {
@@ -1000,6 +1087,7 @@ export const useStore = create<StoreState>((set, get) => ({
         moveClusterResult: result,
         moveClusterUndoStatus: undoStatus,
         moveClusterUndoResult: undefined,
+        objectUndoResult: undefined,
         busy: false,
         busyMessage: undefined
       })
@@ -1051,6 +1139,61 @@ export const useStore = create<StoreState>((set, get) => ({
         objects,
         moveClusterUndoStatus: undoStatus,
         moveClusterUndoResult: result,
+        busy: false,
+        busyMessage: undefined
+      })
+      if (get().globalHighlight) {
+        await get().restoreGlobalClusterColors()
+      }
+    } catch (error) {
+      set({
+        busy: false,
+        busyMessage: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  async loadObjectUndoStatus() {
+    try {
+      const status = await api.getObjectUndoStatus(get().apiBase)
+      set({ objectUndoStatus: status })
+    } catch (error) {
+      set({
+        objectUndoStatus: undefined,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  },
+
+  async undoLatestObjectChange() {
+    const { selectedObjectId } = get()
+    set({
+      busy: true,
+      busyMessage: 'Undoing latest object change',
+      error: undefined,
+      objectUndoResult: undefined,
+      moveClusterUndoResult: undefined
+    })
+    try {
+      const result = await api.undoObjectChange(get().apiBase)
+      const objects = await api.scanFolder(get().apiBase, get().folderPath)
+      const nextSelectedObjectId =
+        objects.find((object) => object.object_id === selectedObjectId)?.object_id ??
+        objects.find((object) => object.is_valid)?.object_id ??
+        ''
+      if (nextSelectedObjectId) {
+        await get().selectObject(nextSelectedObjectId)
+      }
+      const [objectUndoStatus, moveClusterUndoStatus] = await Promise.all([
+        api.getObjectUndoStatus(get().apiBase),
+        api.getMoveClusterUndoStatus(get().apiBase)
+      ])
+      set({
+        objects,
+        objectUndoStatus,
+        objectUndoResult: result,
+        moveClusterUndoStatus,
         busy: false,
         busyMessage: undefined
       })
@@ -1158,6 +1301,7 @@ export const useStore = create<StoreState>((set, get) => ({
         busy: false,
         busyMessage: undefined
       })
+      await get().loadObjectUndoStatus()
       await get().loadClusterLabelEditor()
       await get().loadUmap({ clusterKey: get().clusterKey })
     } catch (error) {
@@ -1227,6 +1371,10 @@ export const useStore = create<StoreState>((set, get) => ({
       set((state) => ({
         geneCatalog,
         selectedGenes: state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+        activeHighlightedGene: effectiveHighlightedGene(
+          state.selectedGenes.filter((gene) => geneCatalog.genes.includes(gene)),
+          state.activeHighlightedGene
+        ),
         dotplotResult: undefined
       }))
     } catch (error) {
@@ -1243,6 +1391,10 @@ export const useStore = create<StoreState>((set, get) => ({
       set((state) => ({
         globalGeneCatalog,
         selectedGenes: state.selectedGenes.filter((gene) => globalGeneCatalog.genes.includes(gene)),
+        activeHighlightedGene: effectiveHighlightedGene(
+          state.selectedGenes.filter((gene) => globalGeneCatalog.genes.includes(gene)),
+          state.activeHighlightedGene
+        ),
         dotplotResult: undefined
       }))
     } catch (error) {
@@ -1256,6 +1408,21 @@ export const useStore = create<StoreState>((set, get) => ({
   setGeneSearch(value) {
     set({ geneSearch: value })
   },
+  addSelectedGenes(genes) {
+    set((state) => {
+      const merged = [...state.selectedGenes]
+      for (const gene of genes) {
+        if (!merged.includes(gene)) {
+          merged.push(gene)
+        }
+      }
+      return {
+        selectedGenes: merged,
+        activeHighlightedGene: effectiveHighlightedGene(merged, state.activeHighlightedGene),
+        dotplotResult: undefined
+      }
+    })
+  },
   toggleGeneSelected(gene) {
     set((state) => {
       const selected = state.selectedGenes.includes(gene)
@@ -1263,12 +1430,20 @@ export const useStore = create<StoreState>((set, get) => ({
         : [...state.selectedGenes, gene]
       return {
         selectedGenes: selected,
+        activeHighlightedGene: effectiveHighlightedGene(selected, state.activeHighlightedGene),
         dotplotResult: undefined
       }
     })
   },
   clearSelectedGenes() {
-    set({ selectedGenes: [], dotplotResult: undefined })
+    set({ selectedGenes: [], activeHighlightedGene: undefined, dotplotResult: undefined })
+  },
+  setActiveHighlightedGene(gene) {
+    set((state) => ({
+      activeHighlightedGene:
+        gene && state.selectedGenes.includes(gene) ? gene : effectiveHighlightedGene(state.selectedGenes, undefined),
+      dotplotResult: undefined
+    }))
   },
   toggleFavoriteGene(gene) {
     set((state) => {
@@ -1290,7 +1465,12 @@ export const useStore = create<StoreState>((set, get) => ({
       ) {
         return state
       }
-      return { selectedGenes: moveArrayItem(state.selectedGenes, fromIndex, toIndex), dotplotResult: undefined }
+      const selectedGenes = moveArrayItem(state.selectedGenes, fromIndex, toIndex)
+      return {
+        selectedGenes,
+        activeHighlightedGene: effectiveHighlightedGene(selectedGenes, state.activeHighlightedGene),
+        dotplotResult: undefined
+      }
     })
   },
   toggleMarkerDiscoveryTarget(clusterId) {
@@ -1332,6 +1512,10 @@ export const useStore = create<StoreState>((set, get) => ({
       set((state) => ({
         markerDiscoveryResult: result,
         selectedGenes: [...state.selectedGenes, ...result.candidate_genes.filter((gene) => !state.selectedGenes.includes(gene))],
+        activeHighlightedGene: effectiveHighlightedGene(
+          [...state.selectedGenes, ...result.candidate_genes.filter((gene) => !state.selectedGenes.includes(gene))],
+          state.activeHighlightedGene
+        ),
         busy: false,
         busyMessage: undefined
       }))
@@ -1346,6 +1530,7 @@ export const useStore = create<StoreState>((set, get) => ({
   async colorBySelectedGene() {
     const {
       selectedGenes,
+      activeHighlightedGene,
       selectedObjectId,
       points,
       geneColorGene,
@@ -1354,13 +1539,20 @@ export const useStore = create<StoreState>((set, get) => ({
       globalBasePoints,
       globalPoints,
       globalGeneColorGene,
-      globalColorMode
+      globalColorMode,
+      geneCatalog,
+      globalGeneCatalog
     } = get()
-    if (selectedGenes.length !== 1) {
-      set({ error: 'Check exactly one gene to color the UMAP by expression.' })
+    const gene = effectiveHighlightedGene(selectedGenes, activeHighlightedGene)
+    if (!gene) {
+      set({ error: 'Select one checked gene to color the UMAP by expression.' })
       return
     }
-    const gene = selectedGenes[0]
+    const availableGenes = activeViewMode === 'global' ? globalGeneCatalog?.genes ?? [] : geneCatalog?.genes ?? []
+    if (!availableGenes.includes(gene)) {
+      set({ error: `Gene is not available in the current ${activeViewMode} view: ${gene}` })
+      return
+    }
     if (activeViewMode === 'lineage' && !selectedObjectId) {
       set({ error: 'Select an object first.' })
       return
@@ -1539,6 +1731,7 @@ export const useStore = create<StoreState>((set, get) => ({
       busyMessage: 'Propagating labels',
       error: undefined,
       sessionId,
+      savePromptOpen: false,
       saveResult: undefined,
       propagationResult: undefined
     })
@@ -1574,6 +1767,7 @@ export const useStore = create<StoreState>((set, get) => ({
         sessionSummary,
         propagationResult,
         colorMode: 'annotation',
+        savePromptOpen: true,
         busy: false,
         busyMessage: undefined
       })
@@ -1608,7 +1802,8 @@ export const useStore = create<StoreState>((set, get) => ({
     set({ busy: true, busyMessage: 'Saving reannotated object', error: undefined })
     try {
       const saveResult = await api.save(get().apiBase, selectedObjectId, { session_id: sessionId })
-      set({ saveResult, busy: false, busyMessage: undefined })
+      set({ saveResult, savePromptOpen: false, busy: false, busyMessage: undefined })
+      await get().loadObjectUndoStatus()
     } catch (error) {
       set({
         busy: false,
@@ -1616,6 +1811,10 @@ export const useStore = create<StoreState>((set, get) => ({
         error: error instanceof Error ? error.message : String(error)
       })
     }
+  },
+
+  dismissSavePrompt() {
+    set({ savePromptOpen: false })
   },
 
   async resetPropagation() {
@@ -1632,6 +1831,7 @@ export const useStore = create<StoreState>((set, get) => ({
       sessionSummary: undefined,
       propagationResult: undefined,
       saveResult: undefined,
+      savePromptOpen: false,
       colorMode: 'cluster',
       error: undefined
     })
@@ -1655,6 +1855,7 @@ export const useStore = create<StoreState>((set, get) => ({
       sessionSummary: undefined,
       propagationResult: undefined,
       saveResult: undefined,
+      savePromptOpen: false,
       colorMode: 'cluster',
       error: undefined
     })
@@ -1666,5 +1867,159 @@ export const useStore = create<StoreState>((set, get) => ({
       busyMessage: undefined,
       error: 'Stopped current request.'
     })
+  },
+
+  // F-04/F-13 — Obs metadata coloring
+  async loadObsColumns() {
+    const { selectedObjectId, activeViewMode, apiBase } = get()
+    if (activeViewMode !== 'global' && !selectedObjectId) return
+    try {
+      const response = activeViewMode === 'global'
+        ? await api.getGlobalObsColumns(apiBase)
+        : await api.getObsColumns(apiBase, selectedObjectId)
+      set({ obsColumns: response.columns })
+    } catch (error) {
+      set({ obsColumns: [], error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  async setActiveObsColumn(column) {
+    const { selectedObjectId, activeViewMode, apiBase, points, globalPoints } = get()
+    set({ activeObsColumn: column })
+    if (!column) {
+      set({ obsColorValues: {} })
+      return
+    }
+    const displayedPoints = activeViewMode === 'global' ? globalPoints : points
+    const indices = displayedPoints.map((p) => p.index)
+    try {
+      const response = activeViewMode === 'global'
+        ? await api.getGlobalObsValues(apiBase, { column, indices })
+        : await api.getObsValues(apiBase, selectedObjectId, { column, indices })
+      const map: Record<number, number | string | null> = {}
+      for (const v of response.values) map[v.index] = v.value
+      set({ obsColorValues: map })
+    } catch {
+      set({ obsColorValues: {} })
+    }
+  },
+
+  // F-08 — Differential expression
+  setDeTargetClusters(clusters) { set({ deTargetClusters: clusters }) },
+  setDeReferenceClusters(clusters) { set({ deReferenceClusters: clusters }) },
+  toggleDeTargetCluster(clusterId) {
+    set((state) => ({
+      deTargetClusters: state.deTargetClusters.includes(clusterId)
+        ? state.deTargetClusters.filter((c) => c !== clusterId)
+        : [...state.deTargetClusters, clusterId]
+    }))
+  },
+  toggleDeReferenceCluster(clusterId) {
+    set((state) => ({
+      deReferenceClusters: state.deReferenceClusters.includes(clusterId)
+        ? state.deReferenceClusters.filter((c) => c !== clusterId)
+        : [...state.deReferenceClusters, clusterId]
+    }))
+  },
+  async runDifferentialExpression() {
+    const { selectedObjectId, apiBase, clusterKey, deTargetClusters, deReferenceClusters } = get()
+    if (!selectedObjectId || deTargetClusters.length === 0) {
+      set({ error: 'Select at least one target cluster for DE analysis.' })
+      return
+    }
+    set({ busy: true, busyMessage: 'Running differential expression', error: undefined, deResult: undefined })
+    try {
+      const result = await api.differentialExpression(apiBase, selectedObjectId, {
+        cluster_key: clusterKey,
+        target_clusters: deTargetClusters,
+        reference_clusters: deReferenceClusters,
+      })
+      set({ deResult: result, busy: false, busyMessage: undefined })
+    } catch (error) {
+      set({ busy: false, busyMessage: undefined, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  // F-09 — Annotation export
+  downloadExportAnnotations(fmt) {
+    const { selectedObjectId, apiBase, sessionId } = get()
+    if (!selectedObjectId) return
+    const url = api.exportAnnotationsUrl(apiBase, selectedObjectId, fmt, sessionId)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `annotations_${selectedObjectId}.${fmt}`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  },
+
+  // F-10 — Project dashboard
+  async loadDashboard() {
+    const { apiBase } = get()
+    set({ busy: true, busyMessage: 'Loading project dashboard', error: undefined, dashboardData: undefined, dashboardVisible: true })
+    try {
+      const data = await api.getDashboard(apiBase)
+      set({ dashboardData: data, busy: false, busyMessage: undefined })
+    } catch (error) {
+      set({ busy: false, busyMessage: undefined, dashboardVisible: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  setDashboardVisible(visible) { set({ dashboardVisible: visible }) },
+
+  // F-15 — Annotation diff
+  async runAnnotationDiff(keyA, keyB) {
+    const { selectedObjectId, apiBase } = get()
+    if (!selectedObjectId) {
+      set({ error: 'Select an object first.' })
+      return
+    }
+    set({ busy: true, busyMessage: 'Comparing annotations', error: undefined, annotationDiffResult: undefined })
+    try {
+      const result = await api.annotationDiff(apiBase, selectedObjectId, { key_a: keyA, key_b: keyB })
+      set({ annotationDiffResult: result, busy: false, busyMessage: undefined })
+    } catch (error) {
+      set({ busy: false, busyMessage: undefined, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  // F-03 — Persistent session recovery
+  async checkLiveSession() {
+    const { selectedObjectId, apiBase } = get()
+    if (!selectedObjectId) return
+    try {
+      const info = await api.getLiveSession(apiBase, selectedObjectId)
+      set({ liveSessionInfo: info })
+    } catch {
+      set({ liveSessionInfo: undefined })
+    }
+  },
+  async restoreLiveSession() {
+    const { selectedObjectId, apiBase, embeddingKey, clusterKey, maxPoints, minPerCluster, maxPerCluster } = get()
+    if (!selectedObjectId) return
+    set({ busy: true, busyMessage: 'Restoring session', error: undefined })
+    try {
+      const summary = await api.restoreLiveSession(apiBase, selectedObjectId)
+      set({ sessionSummary: summary, sessionId: summary.session_id, liveSessionInfo: undefined })
+      // Reload UMAP so annotation colors from restored session are visible
+      const response = await api.getUmap(apiBase, selectedObjectId, {
+        embedding_key: embeddingKey,
+        cluster_key: clusterKey || null,
+        gene_name: null,
+        max_points: maxPoints,
+        min_per_cluster: minPerCluster,
+        max_per_cluster: maxPerCluster,
+        random_seed: 13
+      })
+      set({ points: response.points, busy: false, busyMessage: undefined })
+    } catch (error) {
+      set({ busy: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  },
+  async dismissLiveSession() {
+    const { selectedObjectId, apiBase } = get()
+    if (!selectedObjectId) return
+    try {
+      await api.clearLiveSession(apiBase, selectedObjectId)
+    } catch { /* ignore */ }
+    set({ liveSessionInfo: undefined })
   }
 }))

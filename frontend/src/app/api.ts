@@ -1,15 +1,23 @@
 import type {
+  AnnotationDiffResponse,
   ClusterLabelEditorResponse,
+  DEResponse,
   DotplotResponse,
   GeneCatalogResponse,
   GeneExpressionResponse,
+  LiveSessionResponse,
   MarkerDiscoveryResponse,
   MetadataResponse,
   MoveClusterPreviewResponse,
   MoveClusterResponse,
   MoveClusterUndoResponse,
   MoveClusterUndoStatusResponse,
+  ObjectAnnotationCoverage,
+  ObjectChangeUndoResponse,
+  ObjectChangeUndoStatusResponse,
   ObjectCard,
+  ObsColumnsResponse,
+  ObsValuesResponse,
   PolygonSelectResponse,
   PropagateResponse,
   PointClusterResponse,
@@ -322,6 +330,14 @@ export const api = {
       method: 'POST'
     })
   },
+  getObjectUndoStatus(baseUrl: string) {
+    return requestJson<ObjectChangeUndoStatusResponse>(`${baseUrl}/object-change-undo`)
+  },
+  undoObjectChange(baseUrl: string) {
+    return requestJson<ObjectChangeUndoResponse>(`${baseUrl}/object-change-undo`, {
+      method: 'POST'
+    })
+  },
   previewMoveCluster(
     baseUrl: string,
     objectId: string,
@@ -339,6 +355,82 @@ export const api = {
   promoteReannotNew(baseUrl: string, objectId: string) {
     return requestJson<PromoteReannotLabelsResponse>(`${baseUrl}/objects/${objectId}/promote-reannot-new`, {
       method: 'POST'
+    })
+  },
+
+  // F-04 / F-13 — Obs metadata coloring & QC
+  getObsColumns(baseUrl: string, objectId: string) {
+    return requestJson<ObsColumnsResponse>(`${baseUrl}/objects/${objectId}/obs-columns`)
+  },
+  getGlobalObsColumns(baseUrl: string) {
+    return requestJson<ObsColumnsResponse>(`${baseUrl}/global/obs-columns`)
+  },
+  getObsValues(baseUrl: string, objectId: string, payload: { column: string; indices: number[] }) {
+    return requestJson<ObsValuesResponse>(`${baseUrl}/objects/${objectId}/obs-values`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  getGlobalObsValues(baseUrl: string, payload: { column: string; indices: number[] }) {
+    return requestJson<ObsValuesResponse>(`${baseUrl}/global/obs-values`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+
+  // F-08 — Differential expression
+  differentialExpression(
+    baseUrl: string,
+    objectId: string,
+    payload: {
+      cluster_key: string
+      target_clusters: string[]
+      reference_clusters: string[]
+      top_n?: number
+      method?: 'wilcoxon' | 't-test'
+    }
+  ) {
+    return requestJson<DEResponse>(`${baseUrl}/objects/${objectId}/differential-expression`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+
+  // F-09 — Annotation export (returns URL for direct download)
+  exportAnnotationsUrl(baseUrl: string, objectId: string, fmt: 'csv' | 'tsv' | 'json', sessionId?: string): string {
+    const params = new URLSearchParams({ fmt })
+    if (sessionId) params.set('session_id', sessionId)
+    return `${baseUrl}/objects/${objectId}/export-annotations?${params}`
+  },
+
+  // F-10 — Project dashboard
+  getDashboard(baseUrl: string) {
+    return requestJson<ObjectAnnotationCoverage[]>(`${baseUrl}/dashboard`)
+  },
+  getObjectCoverage(baseUrl: string, objectId: string) {
+    return requestJson<ObjectAnnotationCoverage>(`${baseUrl}/objects/${objectId}/coverage`)
+  },
+
+  // F-15 — Annotation diff
+  annotationDiff(baseUrl: string, objectId: string, payload: { key_a: string; key_b: string }) {
+    return requestJson<AnnotationDiffResponse>(`${baseUrl}/objects/${objectId}/annotation-diff`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+
+  // F-03 — Persistent session recovery
+  getLiveSession(baseUrl: string, objectId: string) {
+    return requestJson<LiveSessionResponse>(`${baseUrl}/objects/${objectId}/live-session`)
+  },
+  restoreLiveSession(baseUrl: string, objectId: string) {
+    return requestJson<SessionSummary>(`${baseUrl}/objects/${objectId}/restore-live-session`, {
+      method: 'POST'
+    })
+  },
+  clearLiveSession(baseUrl: string, objectId: string) {
+    return requestJson<{ status: string; object_id: string }>(`${baseUrl}/objects/${objectId}/live-session`, {
+      method: 'DELETE'
     })
   }
 }

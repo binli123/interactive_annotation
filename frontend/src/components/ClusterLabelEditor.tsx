@@ -12,8 +12,8 @@ export default function ClusterLabelEditor() {
     clusterLabelSaveResult: store.clusterLabelSaveResult,
     moveClusterPreview: store.moveClusterPreview,
     moveClusterResult: store.moveClusterResult,
-    moveClusterUndoStatus: store.moveClusterUndoStatus,
-    moveClusterUndoResult: store.moveClusterUndoResult,
+    objectUndoStatus: store.objectUndoStatus,
+    objectUndoResult: store.objectUndoResult,
     globalMetadata: store.globalMetadata,
     clusterVisibility: store.clusterVisibility,
     setClusterVisibility: store.setClusterVisibility,
@@ -25,7 +25,7 @@ export default function ClusterLabelEditor() {
     previewMoveCluster: store.previewMoveCluster,
     clearMoveClusterPreview: store.clearMoveClusterPreview,
     moveClusterToObject: store.moveClusterToObject,
-    undoLatestMoveCluster: store.undoLatestMoveCluster,
+    undoLatestObjectChange: store.undoLatestObjectChange,
     busy: store.busy
   }))
 
@@ -70,10 +70,10 @@ export default function ClusterLabelEditor() {
           </button>
           <button
             className="button button-secondary"
-            onClick={() => void state.undoLatestMoveCluster()}
-            disabled={!state.moveClusterUndoStatus?.available || state.busy}
+            onClick={() => void state.undoLatestObjectChange()}
+            disabled={!state.objectUndoStatus?.available || state.busy}
           >
-            Undo Moving cluster
+            Undo last object change
           </button>
         </div>
       </div>
@@ -137,16 +137,14 @@ export default function ClusterLabelEditor() {
             : '.'}
         </p>
       ) : null}
-      {state.moveClusterUndoResult ? (
+      {state.objectUndoResult ? (
         <p className="muted">
-          Undid the latest move of {state.moveClusterUndoResult.n_moved_cells.toLocaleString()} cells for{' '}
-          <span className="mono">{state.moveClusterUndoResult.display_name}</span>.
+          Undid the latest object change: {state.objectUndoResult.description}
         </p>
       ) : null}
-      {state.moveClusterUndoStatus?.available ? (
+      {state.objectUndoStatus?.available ? (
         <p className="muted">
-          Latest move available to undo: {state.moveClusterUndoStatus.n_moved_cells?.toLocaleString() ?? 0} cells into{' '}
-          <span className="mono">{state.moveClusterUndoStatus.destination_object_path}</span>.
+          Latest object change available to undo: {state.objectUndoStatus.description}
         </p>
       ) : null}
       {moveClusterId ? (

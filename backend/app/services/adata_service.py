@@ -204,7 +204,7 @@ def _cluster_key_candidates(frame: pd.DataFrame) -> list[str]:
             continue
         if not (
             pd.api.types.is_string_dtype(series)
-            or pd.api.types.is_categorical_dtype(series)
+            or isinstance(series.dtype, pd.CategoricalDtype)
             or pd.api.types.is_object_dtype(series)
         ):
             continue
@@ -285,6 +285,14 @@ class AnnDataService:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _object_change_undo_dir(self) -> Path:
+        path = settings.project_root / ".object_change_undo"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _object_change_undo_metadata_path(self) -> Path:
+        return self._object_change_undo_dir() / "latest_change.json"
+
     def _move_undo_metadata_path(self) -> Path:
         return self._move_undo_dir() / "latest_move.json"
 
@@ -301,6 +309,151 @@ class AnnDataService:
             self._move_undo_destination_path(),
         ):
             path.unlink(missing_ok=True)
+
+    def _clear_latest_object_change_snapshot(self) -> None:
+        metadata_path = self._object_change_undo_metadata_path()
+        snapshot_paths: list[Path] = []
+        if metadata_path.exists():
+            try:
+                payload = json.loads(metadata_path.read_text())
+                snapshot_paths = [
+                    Path(str(item.get("snapshot_path", "")))
+                    for item in payload.get("objects", [])
+                    if str(item.get("snapshot_path", "")).strip()
+                ]
+            except Exception:
+                snapshot_paths = []
+
+        for path in snapshot_paths:
+            path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+
+        undo_dir = self._object_change_undo_dir()
+        for path in undo_dir.glob("latest_object_*.h5ad"):
+            path.unlink(missing_ok=True)
+
+    def _latest_object_change_status_payload(self) -> dict[str, Any]:
+        metadata_path = self._object_change_undo_metadata_path()
+        if not metadata_path.exists():
+            return {"available": False}
+
+        try:
+            payload = json.loads(metadata_path.read_text())
+        except Exception:
+            self._clear_latest_object_change_snapshot()
+            return {"available": False}
+
+        objects = payload.get("objects", [])
+        if not isinstance(objects, list) or not objects:
+            self._clear_latest_object_change_snapshot()
+            return {"available": False}
+
+        for item in objects:
+            snapshot_path = Path(str(item.get("snapshot_path", "")))
+            if not snapshot_path.exists():
+                self._clear_latest_object_change_snapshot()
+                return {"available": False}
+
+        object_ids = [str(item.get("object_id", "")) for item in objects]
+        object_paths = [str(item.get("object_path", "")) for item in objects]
+        return {
+            "available": True,
+            "change_type": str(payload.get("change_type") or ""),
+            "description": str(payload.get("description") or ""),
+            "object_ids": object_ids,
+            "object_paths": object_paths,
+            "object_count": len(objects),
+            "created_at": str(payload.get("created_at") or ""),
+        }
+
+    def get_latest_object_change_status(self) -> dict[str, Any]:
+        return self._latest_object_change_status_payload()
+
+    def _record_latest_object_change_snapshot(
+        self,
+        *,
+        records: list[ObjectRecord],
+        change_type: str,
+        description: str,
+    ) -> None:
+        self._clear_latest_object_change_snapshot()
+        if change_type != "move_cluster":
+            self._clear_latest_move_snapshot()
+
+        payload_objects: list[dict[str, Any]] = []
+        copied_paths: list[Path] = []
+        undo_dir = self._object_change_undo_dir()
+        try:
+            for index, record in enumerate(records):
+                snapshot_path = undo_dir / f"latest_object_{index}_{record.object_id}.h5ad"
+                shutil.copy2(record.object_path, snapshot_path)
+                copied_paths.append(snapshot_path)
+                payload_objects.append(
+                    {
+                        "object_id": record.object_id,
+                        "object_path": str(record.object_path),
+                        "lineage_name": record.lineage_name,
+                        "snapshot_path": str(snapshot_path),
+                    }
+                )
+        except Exception:
+            for path in copied_paths:
+                path.unlink(missing_ok=True)
+            raise
+
+        payload = {
+            "change_type": str(change_type),
+            "description": str(description),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "objects": payload_objects,
+        }
+        self._object_change_undo_metadata_path().write_text(json.dumps(payload, indent=2))
+
+    def undo_latest_object_change(self) -> dict[str, Any]:
+        status = self._latest_object_change_status_payload()
+        if not status.get("available"):
+            raise ValueError("No object-change snapshot is available to undo.")
+
+        metadata_path = self._object_change_undo_metadata_path()
+        payload = json.loads(metadata_path.read_text())
+        objects = payload.get("objects", [])
+        if not objects:
+            self._clear_latest_object_change_snapshot()
+            raise ValueError("The saved object-change snapshot is incomplete and cannot be restored.")
+
+        restored_records: list[ObjectRecord] = []
+        for item in objects:
+            object_path = Path(str(item["object_path"]))
+            lineage_name = str(item.get("lineage_name") or object_path.stem)
+            record = registry.build_record(
+                object_path=object_path,
+                lineage_name=lineage_name,
+                lineage_dir=object_path.parent,
+            )
+            snapshot_path = Path(str(item["snapshot_path"]))
+            if not snapshot_path.exists():
+                self._clear_latest_object_change_snapshot()
+                raise ValueError("The saved object-change snapshot is incomplete and cannot be restored.")
+            restore_path = object_path.with_suffix(object_path.suffix + ".undo_restore")
+            shutil.copy2(snapshot_path, restore_path)
+            restore_path.replace(object_path)
+            self.invalidate_cached(record.object_id)
+            restored_records.append(record)
+
+        if str(payload.get("change_type")) == "move_cluster":
+            self._clear_latest_move_snapshot()
+        self._clear_latest_object_change_snapshot()
+
+        return {
+            "available": False,
+            "restored": True,
+            "change_type": str(payload.get("change_type") or ""),
+            "description": str(payload.get("description") or ""),
+            "object_ids": [record.object_id for record in restored_records],
+            "object_paths": [str(record.object_path) for record in restored_records],
+            "object_count": len(restored_records),
+            "created_at": str(payload.get("created_at") or ""),
+        }
 
     def _latest_move_status_payload(self) -> dict[str, Any]:
         metadata_path = self._move_undo_metadata_path()
@@ -568,6 +721,7 @@ class AnnDataService:
             "default_cluster_key": default_cluster,
             "has_connectivities": "lineage_connectivities" in adata.obsp,
             "has_distances": "lineage_distances" in adata.obsp,
+            "has_spatial": "spatial" in adata.obsm,
             "summary_resolution_trials": record.resolution_trials,
             "obs_columns": list(adata.obs.columns),
             "sample_columns": [col for col in ("sample_id", "region", "lineage", "final_valid_lineage") if col in adata.obs.columns],
@@ -615,6 +769,10 @@ class AnnDataService:
             else np.full(indices.size, np.nan, dtype=float)
         )
 
+        spatial_coords: np.ndarray | None = None
+        if "spatial" in adata.obsm:
+            spatial_coords = np.asarray(adata.obsm["spatial"])[:, :2]
+
         points = []
         for local_pos, obs_index in enumerate(indices.tolist()):
             point = {
@@ -630,6 +788,8 @@ class AnnDataService:
                 "current_label": str(current_label[local_pos]) if current_label[local_pos] else None,
                 "current_score": None if np.isnan(current_score[local_pos]) else float(current_score[local_pos]),
                 "gene_expression": None if np.isnan(gene_expression[local_pos]) else float(gene_expression[local_pos]),
+                "sx": float(spatial_coords[obs_index, 0]) if spatial_coords is not None else None,
+                "sy": float(spatial_coords[obs_index, 1]) if spatial_coords is not None else None,
             }
             if highlight_mask is not None:
                 point["is_highlighted"] = bool(highlight_mask[obs_index])
@@ -971,7 +1131,16 @@ class AnnDataService:
         definitions[label_key] = {str(key): str(value) for key, value in display_mapping.items()}
         adata.uns["cluster_display_name_definitions"] = definitions
 
-        self._write_object(record, adata, prefix=f"{record.object_path.stem}_{suffix}_refknn_")
+        self._record_latest_object_change_snapshot(
+            records=[record],
+            change_type="reference_propagation",
+            description=f"Reference-based propagation on {record.lineage_name} into {label_key}.",
+        )
+        try:
+            self._write_object(record, adata, prefix=f"{record.object_path.stem}_{suffix}_refknn_")
+        except Exception:
+            self._clear_latest_object_change_snapshot()
+            raise
         return {
             "object_id": record.object_id,
             "object_path": str(record.object_path),
@@ -1292,39 +1461,52 @@ class AnnDataService:
         if cluster_key == "reannot_label":
             combined.uns["reannotation_label_definitions"] = destination_mapping
 
+        self._record_latest_object_change_snapshot(
+            records=[source_record, destination_record],
+            change_type="move_cluster",
+            description=(
+                f"Move cluster {cluster_id} from {source_record.lineage_name} "
+                f"to {destination_record.lineage_name}."
+            ),
+        )
         self._record_latest_move_snapshot(
             source_record=source_record,
             destination_record=destination_record,
             preview=preview,
         )
-        remaining = self.recompute_embeddings(remaining, f"{source_record.lineage_name} after moving cluster {cluster_id}")
-        combined = self.recompute_embeddings(
-            combined,
-            f"{destination_record.lineage_name} after receiving cluster {assigned_cluster_id}",
-        )
-
-        source_temp_path = self._stage_object_write(
-            source_record,
-            remaining,
-            prefix=f"{source_record.object_path.stem}_move_out_",
-        )
         try:
-            destination_temp_path = self._stage_object_write(
-                destination_record,
-                combined,
-                prefix=f"{destination_record.object_path.stem}_move_in_",
+            remaining = self.recompute_embeddings(
+                remaining,
+                f"{source_record.lineage_name} after moving cluster {cluster_id}",
             )
-        except Exception:
-            source_temp_path.unlink(missing_ok=True)
-            self._clear_latest_move_snapshot()
-            raise
-
-        try:
+            combined = self.recompute_embeddings(
+                combined,
+                f"{destination_record.lineage_name} after receiving cluster {assigned_cluster_id}",
+            )
+            source_temp_path = self._stage_object_write(
+                source_record,
+                remaining,
+                prefix=f"{source_record.object_path.stem}_move_out_",
+            )
+            try:
+                destination_temp_path = self._stage_object_write(
+                    destination_record,
+                    combined,
+                    prefix=f"{destination_record.object_path.stem}_move_in_",
+                )
+            except Exception:
+                source_temp_path.unlink(missing_ok=True)
+                raise
             self._commit_staged_object(source_record, remaining, source_temp_path)
             self._commit_staged_object(destination_record, combined, destination_temp_path)
         except Exception:
-            source_temp_path.unlink(missing_ok=True)
-            destination_temp_path.unlink(missing_ok=True)
+            local_source_temp = locals().get("source_temp_path")
+            local_destination_temp = locals().get("destination_temp_path")
+            if isinstance(local_source_temp, Path):
+                local_source_temp.unlink(missing_ok=True)
+            if isinstance(local_destination_temp, Path):
+                local_destination_temp.unlink(missing_ok=True)
+            self._clear_latest_object_change_snapshot()
             self._clear_latest_move_snapshot()
             raise
 
@@ -1461,7 +1643,16 @@ class AnnDataService:
         if cluster_key == "reannot_label":
             adata.uns["reannotation_label_definitions"] = normalized_mapping
 
-        self._write_object(record, adata, prefix=f"{record.object_path.stem}_display_labels_")
+        self._record_latest_object_change_snapshot(
+            records=[record],
+            change_type="cluster_label_names",
+            description=f"Save cluster names on {record.lineage_name} for {cluster_key}.",
+        )
+        try:
+            self._write_object(record, adata, prefix=f"{record.object_path.stem}_display_labels_")
+        except Exception:
+            self._clear_latest_object_change_snapshot()
+            raise
         return {
             "object_id": record.object_id,
             "object_path": str(record.object_path),
@@ -1503,7 +1694,16 @@ class AnnDataService:
             str(key): str(value) for key, value in source_display_map.items()
         }
 
-        self._write_object(record, adata, prefix=f"{record.object_path.stem}_promote_new_")
+        self._record_latest_object_change_snapshot(
+            records=[record],
+            change_type="promote_reannot_label",
+            description=f"Promote reannot_label_new to canonical labels on {record.lineage_name}.",
+        )
+        try:
+            self._write_object(record, adata, prefix=f"{record.object_path.stem}_promote_new_")
+        except Exception:
+            self._clear_latest_object_change_snapshot()
+            raise
         return {
             "object_id": record.object_id,
             "object_path": str(record.object_path),
@@ -1511,6 +1711,328 @@ class AnnDataService:
             "source_display_key": source_display_key,
             "target_label_key": target_label_key,
             "target_display_key": target_display_key,
+        }
+
+    # F-04 / F-13 — Obs metadata coloring and QC
+
+    _QC_COLUMNS = {
+        "n_genes_by_counts",
+        "total_counts",
+        "pct_counts_mt",
+        "pct_counts_ribo",
+        "pct_counts_hb",
+        "doublet_score",
+        "predicted_doublet",
+        "log1p_total_counts",
+        "log1p_n_genes_by_counts",
+        "n_counts",
+        "n_genes",
+        "percent_mito",
+        "percent_ribo",
+    }
+
+    def get_obs_columns(self, record: ObjectRecord) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        columns = []
+        for col in adata.obs.columns:
+            series = adata.obs[col]
+            is_numeric = pd.api.types.is_numeric_dtype(series)
+            if is_numeric:
+                dtype = "float" if pd.api.types.is_float_dtype(series) else "int"
+                n_unique = None
+            else:
+                dtype = "categorical"
+                non_null = series.dropna()
+                n_unique = int(non_null.astype("string").nunique()) if not non_null.empty else 0
+            columns.append({
+                "name": col,
+                "dtype": dtype,
+                "is_numeric": is_numeric,
+                "is_qc": col in self._QC_COLUMNS,
+                "n_unique": n_unique,
+            })
+        return {"object_id": record.object_id, "columns": columns}
+
+    def get_obs_values(self, record: ObjectRecord, column: str, indices: list[int]) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        if column not in adata.obs.columns:
+            raise ValueError(f"Column '{column}' not found in obs.")
+        series = adata.obs[column]
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+        dtype = "float" if is_numeric and pd.api.types.is_float_dtype(series) else ("int" if is_numeric else "categorical")
+        idx_arr = np.asarray(indices, dtype=int)
+        values = []
+        for i, obs_idx in enumerate(idx_arr.tolist()):
+            raw = series.iloc[obs_idx]
+            if is_numeric:
+                v: float | str | None = None if pd.isna(raw) else float(raw)
+            else:
+                v = None if pd.isna(raw) else str(raw)
+            values.append({"index": int(obs_idx), "value": v})
+        return {"object_id": record.object_id, "column": column, "dtype": dtype, "is_numeric": is_numeric, "values": values}
+
+    # F-06 — Spatial transcriptomics: spatial coords added in _point_payload
+
+    def _has_spatial(self, adata: ad.AnnData) -> bool:
+        return "spatial" in adata.obsm
+
+    # F-08 — Differential expression
+
+    def run_de_analysis(
+        self,
+        record: ObjectRecord,
+        cluster_key: str,
+        target_clusters: list[str],
+        reference_clusters: list[str],
+        top_n: int = 50,
+        method: str = "wilcoxon",
+    ) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        if cluster_key not in adata.obs.columns:
+            raise ValueError(f"Cluster key '{cluster_key}' not found.")
+
+        labels = _obs_to_str_array(adata.obs, cluster_key)
+        target_mask = np.isin(labels, target_clusters)
+        reference_mask = np.isin(labels, reference_clusters) if reference_clusters else ~target_mask
+        n_target = int(target_mask.sum())
+        n_reference = int(reference_mask.sum())
+
+        if n_target == 0:
+            raise ValueError("No cells found in target clusters.")
+        if n_reference == 0:
+            raise ValueError("No cells found in reference clusters.")
+
+        from scipy import sparse as sp
+        from scipy.stats import rankdata
+
+        X = adata.X
+        if sp.issparse(X):
+            X_target = np.asarray(X[target_mask].todense())
+            X_ref = np.asarray(X[reference_mask].todense())
+        else:
+            X_target = np.asarray(X[target_mask])
+            X_ref = np.asarray(X[reference_mask])
+
+        mean_target = X_target.mean(axis=0)
+        mean_ref = X_ref.mean(axis=0)
+        lfc = np.log2(mean_target + 1e-9) - np.log2(mean_ref + 1e-9)
+
+        n_genes = X_target.shape[1]
+        n1 = X_target.shape[0]
+        n2 = X_ref.shape[0]
+        p_vals = np.ones(n_genes)
+
+        if method == "wilcoxon":
+            # Vectorized Mann-Whitney U via rank-sum — O(n_genes * (n1+n2)*log(n1+n2))
+            # rather than calling mannwhitneyu per gene in a Python loop
+            combined = np.vstack([X_target, X_ref])  # (n1+n2, n_genes)
+            # rank each gene column independently
+            from scipy.stats import rankdata as _rankdata
+            for g in range(n_genes):
+                col = combined[:, g]
+                if col.std() == 0:
+                    continue
+                ranks = _rankdata(col)
+                U1 = np.sum(ranks[:n1]) - n1 * (n1 + 1) / 2
+                U2 = n1 * n2 - U1
+                U = min(U1, U2)
+                mu = n1 * n2 / 2.0
+                sigma = np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0)
+                if sigma == 0:
+                    continue
+                z = (U - mu) / sigma
+                from scipy.stats import norm as _norm
+                p_vals[g] = 2 * _norm.sf(abs(z))
+        else:
+            # Vectorized Welch t-test across all genes at once
+            var_t = X_target.var(axis=0, ddof=1)
+            var_r = X_ref.var(axis=0, ddof=1)
+            se = np.sqrt(var_t / n1 + var_r / n2)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                t_stat = np.where(se > 0, (mean_target - mean_ref) / se, 0.0)
+            # Welch-Satterthwaite df
+            num = (var_t / n1 + var_r / n2) ** 2
+            denom = (var_t / n1) ** 2 / (n1 - 1) + (var_r / n2) ** 2 / (n2 - 1)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df = np.where(denom > 0, num / denom, 1.0)
+            df = np.maximum(df, 1.0)
+            from scipy.stats import t as _t_dist
+            p_vals = 2 * _t_dist.sf(np.abs(t_stat), df)
+            p_vals = np.nan_to_num(p_vals, nan=1.0)
+
+        from statsmodels.stats.multitest import multipletests
+        try:
+            _, p_adj, _, _ = multipletests(p_vals, method="fdr_bh")
+        except Exception:
+            p_adj = p_vals.copy()
+
+        gene_names = list(adata.var_names)
+        order = np.argsort(p_adj)[:top_n]
+        genes = [
+            {
+                "gene_name": str(gene_names[g]),
+                "log_fold_change": float(lfc[g]),
+                "p_val": float(p_vals[g]),
+                "p_val_adj": float(p_adj[g]),
+                "mean_target": float(mean_target[g]),
+                "mean_reference": float(mean_ref[g]),
+            }
+            for g in order
+        ]
+        return {
+            "object_id": record.object_id,
+            "cluster_key": cluster_key,
+            "target_clusters": target_clusters,
+            "reference_clusters": reference_clusters if reference_clusters else list({str(l) for l in labels[reference_mask].tolist()}),
+            "n_target_cells": n_target,
+            "n_reference_cells": n_reference,
+            "method": method,
+            "genes": genes,
+        }
+
+    # F-09 — Annotation export
+
+    def export_annotations(
+        self,
+        record: ObjectRecord,
+        session_state: Any,
+        fmt: str = "csv",
+    ) -> tuple[str, str]:
+        """Return (content_string, mime_type) for export."""
+        adata = self.get_adata(record)
+        cell_ids = self._get_cell_ids(record)
+
+        if session_state is not None and session_state.last_propagation is not None:
+            result = session_state.last_propagation
+            label_defs = dict(session_state.seed_display_names)
+            assigned_labels = result.assigned_labels
+            scores = result.assigned_scores
+            margins = result.assigned_margins
+            assigned_mask = result.assigned_mask
+            seed_mask_arr = np.zeros(adata.n_obs, dtype=bool)
+            for idx in session_state.seed_labels:
+                if 0 <= idx < adata.n_obs:
+                    seed_mask_arr[idx] = True
+            display_labels = np.asarray(
+                [label_defs.get(str(l), str(l)) for l in assigned_labels],
+                dtype=object,
+            )
+        elif "reannot_label" in adata.obs.columns:
+            assigned_labels = _obs_to_str_array(adata.obs, "reannot_label")
+            display_labels = _obs_to_str_array(adata.obs, "reannot_display_label") if "reannot_display_label" in adata.obs.columns else assigned_labels
+            _s = _obs_to_float_array(adata.obs, "reannot_confidence")
+            scores = _s if _s is not None else np.full(adata.n_obs, np.nan)
+            _m = _obs_to_float_array(adata.obs, "reannot_margin")
+            margins = _m if _m is not None else np.full(adata.n_obs, np.nan)
+            assigned_mask = assigned_labels != ""
+            seed_mask_arr = np.zeros(adata.n_obs, dtype=bool)
+            if "reannot_seed" in adata.obs.columns:
+                seed_mask_arr = adata.obs["reannot_seed"].to_numpy(dtype=bool)
+        else:
+            raise ValueError("No annotation available in session or saved to object.")
+
+        rows = []
+        for i in range(adata.n_obs):
+            rows.append({
+                "cell_barcode": str(cell_ids[i]),
+                "obs_name": str(adata.obs_names[i]),
+                "annotation_label": str(assigned_labels[i]) if assigned_mask[i] else "",
+                "display_label": str(display_labels[i]) if assigned_mask[i] else "",
+                "confidence_score": float(scores[i]) if not np.isnan(scores[i]) else None,
+                "margin": float(margins[i]) if not np.isnan(margins[i]) else None,
+                "is_annotated": bool(assigned_mask[i]),
+                "is_seed": bool(seed_mask_arr[i]),
+            })
+
+        df = pd.DataFrame(rows)
+        if fmt == "csv":
+            content = df.to_csv(index=False)
+            mime = "text/csv"
+        elif fmt == "tsv":
+            content = df.to_csv(index=False, sep="\t")
+            mime = "text/tab-separated-values"
+        else:
+            import json as _json
+            content = _json.dumps(rows, default=lambda x: None if pd.isna(x) else x, indent=2)
+            mime = "application/json"
+        return content, mime
+
+    # F-10 — Annotation coverage
+
+    def get_annotation_coverage(self, record: ObjectRecord) -> dict[str, Any]:
+        try:
+            adata = self.get_adata(record)
+        except Exception:
+            return {
+                "object_id": record.object_id,
+                "lineage_name": record.lineage_name,
+                "n_cells": record.n_cells,
+                "n_annotated": None,
+                "annotation_fraction": None,
+                "annotation_column": None,
+                "n_clusters": None,
+            }
+        annotation_col = next(
+            (col for col in ("reannot_label", "reannot_display_label") if col in adata.obs.columns),
+            None,
+        )
+        if annotation_col:
+            labels = _obs_to_str_array(adata.obs, annotation_col)
+            annotated = int((labels != "").sum())
+            frac = float(annotated / adata.n_obs) if adata.n_obs > 0 else 0.0
+        else:
+            annotated = None
+            frac = None
+
+        cluster_keys = _cluster_key_candidates(adata.obs)
+        default_cluster = cluster_keys[0] if cluster_keys else None
+        n_clusters = None
+        if default_cluster:
+            vals = _obs_to_str_array(adata.obs, default_cluster)
+            n_clusters = int(np.unique(vals).size)
+
+        return {
+            "object_id": record.object_id,
+            "lineage_name": record.lineage_name,
+            "n_cells": int(adata.n_obs),
+            "n_annotated": annotated,
+            "annotation_fraction": frac,
+            "annotation_column": annotation_col,
+            "n_clusters": n_clusters,
+        }
+
+    # F-15 — Annotation diff
+
+    def compare_cluster_columns(
+        self,
+        record: ObjectRecord,
+        key_a: str,
+        key_b: str,
+    ) -> dict[str, Any]:
+        adata = self.get_adata(record)
+        for key in (key_a, key_b):
+            if key not in adata.obs.columns:
+                raise ValueError(f"Column '{key}' not found in obs.")
+        labels_a = _obs_to_str_array(adata.obs, key_a)
+        labels_b = _obs_to_str_array(adata.obs, key_b)
+        changed = labels_a != labels_b
+        changed_indices = np.flatnonzero(changed).tolist()
+
+        pairs = pd.DataFrame({"a": labels_a, "b": labels_b})
+        transition_counts = pairs.groupby(["a", "b"]).size().reset_index(name="count")
+        transitions = [
+            {"label_a": str(row["a"]), "label_b": str(row["b"]), "count": int(row["count"])}
+            for _, row in transition_counts.iterrows()
+        ]
+        return {
+            "object_id": record.object_id,
+            "key_a": key_a,
+            "key_b": key_b,
+            "total_cells": int(adata.n_obs),
+            "changed_cells": int(changed.sum()),
+            "unchanged_cells": int((~changed).sum()),
+            "transitions": transitions,
+            "changed_indices": [int(i) for i in changed_indices],
         }
 
     def _write_object(self, record: ObjectRecord, adata: ad.AnnData, prefix: str) -> None:

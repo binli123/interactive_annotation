@@ -8,18 +8,24 @@ import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.models.state import PolygonSeedBatch, PropagationSnapshot
 from app.schemas.api import (
+    AnnotationDiffRequest,
+    AnnotationDiffResponse,
     ClusterLabelEditorResponse,
+    DERequest,
+    DEResponse,
     DotplotRequest,
     DotplotResponse,
     GeneCatalogResponse,
     GeneExpressionRequest,
     GeneExpressionResponse,
     HighlightGlobalRequest,
+    LiveSessionResponse,
     MarkerDiscoveryRequest,
     MarkerDiscoveryResponse,
     MetadataResponse,
@@ -28,7 +34,13 @@ from app.schemas.api import (
     MoveClusterResponse,
     MoveClusterUndoResponse,
     MoveClusterUndoStatusResponse,
+    ObjectAnnotationCoverage,
+    ObjectChangeUndoResponse,
+    ObjectChangeUndoStatusResponse,
     ObjectCard,
+    ObsColumnsResponse,
+    ObsValuesRequest,
+    ObsValuesResponse,
     PointClusterRequest,
     PointClusterResponse,
     PolygonSelectRequest,
@@ -456,6 +468,7 @@ def seed_labels(object_id: str, request: SeedLabelsRequest) -> SessionSummaryRes
         )
         session_store.register_batch(session.session_id, batch)
 
+    session_store.persist(session.session_id, record.lineage_dir)
     return SessionSummaryResponse(**session_store.summarize(session.session_id))
 
 
@@ -606,6 +619,7 @@ def propagate(object_id: str, request: PropagateRequest) -> PropagateResponse:
                 }
             )
 
+    session_store.persist(request.session_id, record.lineage_dir)
     return PropagateResponse(
         session_id=request.session_id,
         method=request.method,
@@ -716,7 +730,16 @@ def save_session(object_id: str, request: SaveRequest) -> SaveResponse:
     adata.uns["reannotation_label_definitions"] = label_definitions_safe
     adata.uns["reannotation_save_manifest"] = save_manifest_safe
 
-    adata_service._write_object(record, adata, prefix=f"{record.object_path.stem}_save_")
+    adata_service._record_latest_object_change_snapshot(
+        records=[record],
+        change_type="save_reannotated_object",
+        description=f"Save propagated reannotation fields on {record.lineage_name}.",
+    )
+    try:
+        adata_service._write_object(record, adata, prefix=f"{record.object_path.stem}_save_")
+    except Exception:
+        adata_service._clear_latest_object_change_snapshot()
+        raise
     cluster_series = (
         adata.obs[result.cluster_key].astype("string").fillna("NA")
         if result.cluster_key in adata.obs.columns
@@ -810,3 +833,152 @@ def undo_move_cluster() -> MoveClusterUndoResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     registry.scan(registry.scan_root or settings.default_lineage_root)
     return MoveClusterUndoResponse(**payload)
+
+
+@router.get("/object-change-undo", response_model=ObjectChangeUndoStatusResponse)
+def object_change_undo_status() -> ObjectChangeUndoStatusResponse:
+    return ObjectChangeUndoStatusResponse(**adata_service.get_latest_object_change_status())
+
+
+@router.post("/object-change-undo", response_model=ObjectChangeUndoResponse)
+def undo_object_change() -> ObjectChangeUndoResponse:
+    try:
+        payload = adata_service.undo_latest_object_change()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    registry.scan(registry.scan_root or settings.default_lineage_root)
+    return ObjectChangeUndoResponse(**payload)
+
+
+# ── F-04 / F-13  Obs metadata coloring & QC ──────────────────────────────────
+
+@router.get("/objects/{object_id}/obs-columns", response_model=ObsColumnsResponse)
+def object_obs_columns(object_id: str) -> ObsColumnsResponse:
+    record = _resolve_record(object_id)
+    payload = adata_service.get_obs_columns(record)
+    return ObsColumnsResponse(**payload)
+
+
+@router.post("/objects/{object_id}/obs-values", response_model=ObsValuesResponse)
+def object_obs_values(object_id: str, request: ObsValuesRequest) -> ObsValuesResponse:
+    record = _resolve_record(object_id)
+    try:
+        payload = adata_service.get_obs_values(record, request.column, request.indices)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ObsValuesResponse(**payload)
+
+
+@router.get("/global/obs-columns", response_model=ObsColumnsResponse)
+def global_obs_columns() -> ObsColumnsResponse:
+    record = _global_record()
+    payload = adata_service.get_obs_columns(record)
+    return ObsColumnsResponse(**payload)
+
+
+@router.post("/global/obs-values", response_model=ObsValuesResponse)
+def global_obs_values(request: ObsValuesRequest) -> ObsValuesResponse:
+    record = _global_record()
+    try:
+        payload = adata_service.get_obs_values(record, request.column, request.indices)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ObsValuesResponse(**payload)
+
+
+# ── F-08  Differential expression ────────────────────────────────────────────
+
+@router.post("/objects/{object_id}/differential-expression", response_model=DEResponse)
+def differential_expression(object_id: str, request: DERequest) -> DEResponse:
+    record = _resolve_record(object_id)
+    try:
+        payload = adata_service.run_de_analysis(
+            record=record,
+            cluster_key=request.cluster_key,
+            target_clusters=request.target_clusters,
+            reference_clusters=request.reference_clusters,
+            top_n=request.top_n,
+            method=request.method,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DEResponse(**payload)
+
+
+# ── F-09  Annotation export ───────────────────────────────────────────────────
+
+@router.get("/objects/{object_id}/export-annotations")
+def export_annotations(
+    object_id: str,
+    fmt: str = Query(default="csv", pattern="^(csv|tsv|json)$"),
+    session_id: str | None = Query(default=None),
+) -> StreamingResponse:
+    record = _resolve_record(object_id)
+    session_state = None
+    if session_id:
+        try:
+            session_state = session_store.get(session_id)
+        except KeyError:
+            pass
+    try:
+        content, mime = adata_service.export_annotations(record, session_state, fmt=fmt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = f"{record.lineage_name}_annotations.{fmt}"
+    return StreamingResponse(
+        iter([content]),
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── F-10  Project dashboard ───────────────────────────────────────────────────
+
+@router.get("/objects/{object_id}/coverage", response_model=ObjectAnnotationCoverage)
+def object_coverage(object_id: str) -> ObjectAnnotationCoverage:
+    record = _resolve_record(object_id)
+    payload = adata_service.get_annotation_coverage(record)
+    return ObjectAnnotationCoverage(**payload)
+
+
+@router.get("/dashboard", response_model=list[ObjectAnnotationCoverage])
+def dashboard() -> list[ObjectAnnotationCoverage]:
+    records = registry.list_records()
+    return [ObjectAnnotationCoverage(**adata_service.get_annotation_coverage(r)) for r in records]
+
+
+# ── F-15  Annotation diff ─────────────────────────────────────────────────────
+
+@router.post("/objects/{object_id}/annotation-diff", response_model=AnnotationDiffResponse)
+def annotation_diff(object_id: str, request: AnnotationDiffRequest) -> AnnotationDiffResponse:
+    record = _resolve_record(object_id)
+    try:
+        payload = adata_service.compare_cluster_columns(record, request.key_a, request.key_b)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AnnotationDiffResponse(**payload)
+
+
+# ── F-03  Persistent session recovery ────────────────────────────────────────
+
+@router.get("/objects/{object_id}/live-session", response_model=LiveSessionResponse)
+def live_session_status(object_id: str) -> LiveSessionResponse:
+    record = _resolve_record(object_id)
+    summary = session_store.live_session_summary(record.lineage_dir, object_id)
+    return LiveSessionResponse(**summary)
+
+
+@router.post("/objects/{object_id}/restore-live-session", response_model=SessionSummaryResponse)
+def restore_live_session(object_id: str) -> SessionSummaryResponse:
+    record = _resolve_record(object_id)
+    session = session_store.restore_live(record.lineage_dir, object_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No live session found for this object.")
+    return SessionSummaryResponse(**session_store.summarize(session.session_id))
+
+
+@router.delete("/objects/{object_id}/live-session")
+def clear_live_session(object_id: str) -> dict[str, str]:
+    record = _resolve_record(object_id)
+    session_store.clear_live(record.lineage_dir, object_id)
+    return {"status": "cleared", "object_id": object_id}

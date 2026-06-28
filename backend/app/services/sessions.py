@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import json
+import numpy as np
 import pandas as pd
 
 from app.models.state import PolygonSeedBatch, PropagationSnapshot, SessionState
@@ -156,6 +157,134 @@ class SessionStore:
         polygons_geojson_path.write_text(json.dumps(geojson, indent=2))
         pd.DataFrame(cluster_summary).to_csv(summary_csv_path, index=False)
         return session_json_path, polygons_geojson_path, summary_csv_path
+
+    # F-03 — Persistent session recovery
+
+    @staticmethod
+    def _live_session_path(lineage_dir: Path, object_id: str) -> Path:
+        return lineage_dir / f".live_session_{object_id}.json"
+
+    def persist(self, session_id: str, lineage_dir: Path) -> None:
+        """Write session to disk so it survives server restarts."""
+        try:
+            session = self.get(session_id)
+        except KeyError:
+            return
+        sidecar = self.session_sidecar(session_id)
+        path = self._live_session_path(lineage_dir, session.object_id)
+        path.write_text(json.dumps(sidecar, indent=2))
+
+    def load_live(self, lineage_dir: Path, object_id: str) -> dict[str, Any] | None:
+        """Read persisted session from disk and return summary; does not restore into RAM."""
+        path = self._live_session_path(lineage_dir, object_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return None
+        return data
+
+    def restore_live(self, lineage_dir: Path, object_id: str) -> SessionState | None:
+        """Restore persisted session from disk into RAM."""
+        data = self.load_live(lineage_dir, object_id)
+        if data is None:
+            return None
+        session_id = str(data.get("session_id", ""))
+        embedding_key = str(data.get("embedding_key", ""))
+        cluster_key = str(data.get("cluster_key", ""))
+        if not session_id:
+            return None
+
+        session = SessionState(
+            session_id=session_id,
+            object_id=object_id,
+            embedding_key=embedding_key,
+            cluster_key=cluster_key,
+        )
+        session.seed_display_names = {str(k): str(v) for k, v in (data.get("labels") or {}).items()}
+
+        for polygon_data in data.get("polygons") or []:
+            batch = PolygonSeedBatch(
+                polygon_id=str(polygon_data["polygon_id"]),
+                label=str(polygon_data["label"]),
+                display_name=polygon_data.get("display_name"),
+                notes=polygon_data.get("notes"),
+                cell_indices=np.array([], dtype=int),
+                vertices=polygon_data.get("vertices", []),
+            )
+            session.polygon_batches.append(batch)
+
+        for str_idx, label in (data.get("seed_labels") or {}).items():
+            try:
+                idx = int(str_idx)
+                session.seed_labels[idx] = str(label)
+            except (ValueError, TypeError):
+                pass
+
+        for str_idx, poly_ids in (data.get("seed_polygon_ids") or {}).items():
+            try:
+                idx = int(str_idx)
+                session.seed_polygon_ids[idx] = set(poly_ids)
+            except (ValueError, TypeError):
+                pass
+
+        self._sessions[session_id] = session
+        return session
+
+    def clear_live(self, lineage_dir: Path, object_id: str) -> None:
+        """Delete the persisted live session file and evict any matching RAM session."""
+        path = self._live_session_path(lineage_dir, object_id)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                stale_id = data.get("session_id")
+                if stale_id:
+                    self._sessions.pop(stale_id, None)
+            except Exception:
+                pass
+        path.unlink(missing_ok=True)
+
+    def live_session_summary(self, lineage_dir: Path, object_id: str) -> dict[str, Any]:
+        """Return lightweight summary for UI restore prompt.
+
+        Returns `available: False` if no file exists, or if the persisted
+        session is already active in RAM (user already restored it this run).
+        """
+        data = self.load_live(lineage_dir, object_id)
+        if data is None:
+            return {"object_id": object_id, "available": False}
+
+        # If the session from disk is already loaded in RAM, don't offer restore
+        persisted_id = data.get("session_id")
+        if persisted_id and persisted_id in self._sessions:
+            session = self._sessions[persisted_id]
+            has_propagation = session.last_propagation is not None
+            label_counts = Counter(session.seed_labels.values())
+            return {
+                "object_id": object_id,
+                "available": False,  # already active — banner should not show
+                "session_id": persisted_id,
+                "n_seed_cells": len(session.seed_labels),
+                "n_polygons": len(session.polygon_batches),
+                "labels": dict(sorted(label_counts.items())),
+                "has_propagation": has_propagation,
+            }
+
+        seed_labels = data.get("seed_labels") or {}
+        polygons = data.get("polygons") or []
+        label_counts = Counter(seed_labels.values())
+        return {
+            "object_id": object_id,
+            "available": True,
+            "session_id": persisted_id,
+            "n_seed_cells": len(seed_labels),
+            "n_polygons": len(polygons),
+            "labels": dict(sorted(label_counts.items())),
+            "embedding_key": data.get("embedding_key"),
+            "cluster_key": data.get("cluster_key"),
+            "has_propagation": data.get("last_propagation") is not None,
+        }
 
 
 session_store = SessionStore()

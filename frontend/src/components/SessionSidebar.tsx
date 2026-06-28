@@ -76,10 +76,12 @@ export default function SessionSidebar() {
     propagate: store.propagate,
     resetPropagation: store.resetPropagation,
     saveSession: store.saveSession,
+    dismissSavePrompt: store.dismissSavePrompt,
     resetSession: store.resetSession,
     sessionSummary: store.sessionSummary,
     propagationResult: store.propagationResult,
     saveResult: store.saveResult,
+    savePromptOpen: store.savePromptOpen,
     clusterLabelEditor: store.clusterLabelEditor,
     referenceClusters: store.referenceClusters,
     sourceClusters: store.sourceClusters,
@@ -644,6 +646,32 @@ export default function SessionSidebar() {
           </div>
         ) : null}
       </section>
+
+      {state.savePromptOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="save-propagation-title">
+            <h3 id="save-propagation-title">Propagation finished</h3>
+            <p className="muted">
+              Propagation completed. Save the reannotated object now, or continue working and save it later from the
+              Session panel.
+            </p>
+            {state.propagationResult ? (
+              <div className="summary-block">
+                <div>Assigned cells: {state.propagationResult.n_assigned_cells.toLocaleString()}</div>
+                <div>Eligible cells: {state.propagationResult.n_eligible_cells.toLocaleString()}</div>
+              </div>
+            ) : null}
+            <div className="modal-actions">
+              <button className="button" onClick={() => void state.saveSession()} disabled={state.busy}>
+                Save now
+              </button>
+              <button className="button button-secondary" onClick={state.dismissSavePrompt} disabled={state.busy}>
+                Not now
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

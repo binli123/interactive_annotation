@@ -22,6 +22,7 @@ export type MetadataResponse = {
   default_cluster_key?: string | null
   has_connectivities: boolean
   has_distances: boolean
+  has_spatial: boolean
   summary_resolution_trials: Array<Record<string, unknown>>
   obs_columns: string[]
   sample_columns: string[]
@@ -42,6 +43,8 @@ export type UmapPoint = {
   current_score?: number | null
   gene_expression?: number | null
   is_highlighted?: boolean | null
+  sx?: number | null
+  sy?: number | null
 }
 
 export type UmapResponse = {
@@ -241,6 +244,27 @@ export type MoveClusterUndoResponse = {
   created_at: string
 }
 
+export type ObjectChangeUndoStatusResponse = {
+  available: boolean
+  change_type?: string | null
+  description?: string | null
+  object_ids: string[]
+  object_paths: string[]
+  object_count?: number | null
+  created_at?: string | null
+}
+
+export type ObjectChangeUndoResponse = {
+  available: boolean
+  restored: boolean
+  change_type: string
+  description: string
+  object_ids: string[]
+  object_paths: string[]
+  object_count: number
+  created_at: string
+}
+
 export type GeneCatalogResponse = {
   object_id: string
   object_path: string
@@ -308,3 +332,89 @@ export type PolygonFeatureCollection = {
     }
   }>
 }
+
+// F-04 / F-13 — Obs metadata coloring
+export type ObsColumnMeta = {
+  name: string
+  dtype: 'float' | 'int' | 'categorical'
+  is_numeric: boolean
+  is_qc: boolean
+  n_unique?: number | null
+}
+
+export type ObsColumnsResponse = {
+  object_id: string
+  columns: ObsColumnMeta[]
+}
+
+export type ObsValuesResponse = {
+  object_id: string
+  column: string
+  dtype: string
+  is_numeric: boolean
+  values: Array<{ index: number; value: number | string | null }>
+}
+
+// F-08 — Differential expression
+export type DEGene = {
+  gene_name: string
+  log_fold_change: number
+  p_val_adj: number
+  p_val: number
+  mean_target: number
+  mean_reference: number
+}
+
+export type DEResponse = {
+  object_id: string
+  cluster_key: string
+  target_clusters: string[]
+  reference_clusters: string[]
+  n_target_cells: number
+  n_reference_cells: number
+  method: string
+  genes: DEGene[]
+}
+
+// F-15 — Annotation diff
+export type AnnotationDiffTransition = {
+  label_a: string
+  label_b: string
+  count: number
+}
+
+export type AnnotationDiffResponse = {
+  object_id: string
+  key_a: string
+  key_b: string
+  total_cells: number
+  changed_cells: number
+  unchanged_cells: number
+  transitions: AnnotationDiffTransition[]
+  changed_indices: number[]
+}
+
+// F-03 — Persistent session
+export type LiveSessionResponse = {
+  object_id: string
+  available: boolean
+  session_id?: string | null
+  n_seed_cells?: number | null
+  n_polygons?: number | null
+  labels?: Record<string, number> | null
+  embedding_key?: string | null
+  cluster_key?: string | null
+  has_propagation?: boolean | null
+}
+
+// F-10 — Project dashboard
+export type ObjectAnnotationCoverage = {
+  object_id: string
+  lineage_name: string
+  n_cells?: number | null
+  n_annotated?: number | null
+  annotation_fraction?: number | null
+  annotation_column?: string | null
+  n_clusters?: number | null
+}
+

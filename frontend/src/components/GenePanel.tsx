@@ -3,12 +3,15 @@ import { useStore } from '../app/store'
 
 export default function GenePanel() {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [genePasteValue, setGenePasteValue] = useState('')
+  const [pasteFeedback, setPasteFeedback] = useState<string | null>(null)
   const state = useStore((store) => ({
     activeViewMode: store.activeViewMode,
     geneCatalog: store.geneCatalog,
     globalGeneCatalog: store.globalGeneCatalog,
     geneSearch: store.geneSearch,
     selectedGenes: store.selectedGenes,
+    activeHighlightedGene: store.activeHighlightedGene,
     favoriteGenes: store.favoriteGenes,
     clusterLabelEditor: store.clusterLabelEditor,
     clusterVisibility: store.clusterVisibility,
@@ -16,8 +19,10 @@ export default function GenePanel() {
     markerDiscoveryTopN: store.markerDiscoveryTopN,
     markerDiscoveryResult: store.markerDiscoveryResult,
     setGeneSearch: store.setGeneSearch,
+    addSelectedGenes: store.addSelectedGenes,
     toggleGeneSelected: store.toggleGeneSelected,
     clearSelectedGenes: store.clearSelectedGenes,
+    setActiveHighlightedGene: store.setActiveHighlightedGene,
     toggleFavoriteGene: store.toggleFavoriteGene,
     reorderSelectedGenes: store.reorderSelectedGenes,
     toggleMarkerDiscoveryTarget: store.toggleMarkerDiscoveryTarget,
@@ -34,6 +39,16 @@ export default function GenePanel() {
 
   const favoriteSet = useMemo(() => new Set(state.favoriteGenes), [state.favoriteGenes])
   const selectedSet = useMemo(() => new Set(state.selectedGenes), [state.selectedGenes])
+  const geneLookup = useMemo(
+    () => new Map((geneCatalog?.genes ?? []).map((gene) => [gene.toLowerCase(), gene] as const)),
+    [geneCatalog?.genes]
+  )
+  const effectiveHighlightedGene =
+    state.activeHighlightedGene && selectedSet.has(state.activeHighlightedGene)
+      ? state.activeHighlightedGene
+      : state.selectedGenes.length === 1
+        ? state.selectedGenes[0]
+        : undefined
   const filteredGenes = useMemo(() => {
     const query = state.geneSearch.trim().toLowerCase()
     const genes = geneCatalog?.genes ?? []
@@ -48,6 +63,40 @@ export default function GenePanel() {
         return left.localeCompare(right)
       })
   }, [favoriteSet, geneCatalog?.genes, state.geneSearch])
+
+  function applyGenePaste(rawValue: string) {
+    const tokens = rawValue
+      .split(/[\s,;|]+/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    if (tokens.length === 0) {
+      setPasteFeedback('No gene symbols were found in the pasted text.')
+      return
+    }
+
+    const matched: string[] = []
+    const missing: string[] = []
+    const seen = new Set<string>()
+    for (const token of tokens) {
+      const match = geneLookup.get(token.toLowerCase())
+      if (match) {
+        if (!seen.has(match)) {
+          matched.push(match)
+          seen.add(match)
+        }
+      } else {
+        missing.push(token)
+      }
+    }
+
+    if (matched.length > 0) {
+      state.addSelectedGenes(matched)
+    }
+    setPasteFeedback(
+      `${matched.length} matched${missing.length > 0 ? `, ${missing.length} not found` : ''}.`
+    )
+    setGenePasteValue('')
+  }
 
   if (!geneCatalog) {
     return (
@@ -84,6 +133,46 @@ export default function GenePanel() {
           />
         </label>
 
+        <label className="field">
+          <span>Paste gene list</span>
+          <textarea
+            value={genePasteValue}
+            onChange={(event) => setGenePasteValue(event.target.value)}
+            onPaste={(event) => {
+              const pasted = event.clipboardData.getData('text')
+              if (!pasted) {
+                return
+              }
+              event.preventDefault()
+              applyGenePaste(pasted)
+            }}
+            rows={3}
+            placeholder="Paste genes separated by commas, spaces, tabs, semicolons, or new lines"
+          />
+        </label>
+        <div className="button-row gene-paste-actions">
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => applyGenePaste(genePasteValue)}
+            disabled={genePasteValue.trim().length === 0}
+          >
+            Check pasted genes
+          </button>
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => {
+              setGenePasteValue('')
+              setPasteFeedback(null)
+            }}
+            disabled={genePasteValue.length === 0 && !pasteFeedback}
+          >
+            Clear paste box
+          </button>
+        </div>
+        {pasteFeedback ? <p className="muted">{pasteFeedback}</p> : null}
+
         <div className="selected-gene-block">
           <div className="cluster-label-header">
             <div>
@@ -111,6 +200,21 @@ export default function GenePanel() {
                   }}
                   onDragEnd={() => setDragIndex(null)}
                 >
+                  <button
+                    className={`chip-highlight-toggle ${effectiveHighlightedGene === gene ? 'is-active' : ''}`}
+                    type="button"
+                    onClick={() => state.setActiveHighlightedGene(gene)}
+                    aria-label={
+                      effectiveHighlightedGene === gene
+                        ? `${gene} is the active highlighted gene`
+                        : `Use ${gene} for UMAP gene coloring`
+                    }
+                    title={
+                      effectiveHighlightedGene === gene
+                        ? 'Active gene for UMAP coloring'
+                        : 'Use this gene for UMAP coloring'
+                    }
+                  />
                   <span className="mono">{gene}</span>
                   <button className="chip-remove" onClick={() => state.toggleGeneSelected(gene)}>
                     x
@@ -124,7 +228,7 @@ export default function GenePanel() {
         <div className="button-row gene-action-row">
           <button
             className="button"
-            disabled={state.busy || state.selectedGenes.length !== 1}
+            disabled={state.busy || !effectiveHighlightedGene}
             onClick={() => void state.colorBySelectedGene()}
           >
             Color UMAP by gene
@@ -137,6 +241,9 @@ export default function GenePanel() {
             Preview dotplot
           </button>
         </div>
+        {state.selectedGenes.length > 1 && !effectiveHighlightedGene ? (
+          <p className="muted">Choose one checked gene in Selected Genes to drive UMAP coloring.</p>
+        ) : null}
         <button className="button button-secondary gene-save-button" onClick={state.restoreClusterColorView}>
           Restore cluster colors
         </button>

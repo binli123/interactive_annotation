@@ -28,7 +28,7 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         VITE_API_BASE: /api
-        VITE_DEFAULT_FOLDER: /data/lineages_current
+        VITE_DEFAULT_FOLDER: ""
     ports:
       - "${INTERACTIVE_ANNOTATION_PORT:-5173}:80"
     depends_on:

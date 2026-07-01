@@ -420,6 +420,7 @@ export const useStore = create<StoreState>((set, get) => ({
   error: undefined,
 
   async scanFolder() {
+    if (!get().folderPath) return
     set({ busy: true, busyMessage: 'Scanning objects', error: undefined })
     try {
       const objects = await api.scanFolder(get().apiBase, get().folderPath)

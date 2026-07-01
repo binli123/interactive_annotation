@@ -447,7 +447,15 @@ export const useStore = create<StoreState>((set, get) => ({
       set({
         busy: false,
         busyMessage: undefined,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        objects: [],
+        selectedObjectId: '',
+        metadata: undefined,
+        points: [],
+        polygons: [],
+        sessionSummary: undefined,
+        clusterLabelEditor: undefined,
+        liveSessionInfo: undefined
       })
     }
   },

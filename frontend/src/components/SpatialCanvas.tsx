@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer } from '@deck.gl/layers'
 import { OrthographicView } from '@deck.gl/core'
-import type { UmapPoint, PaletteName } from '../app/types'
+import type { PaletteName } from '../app/types'
 import { useStore } from '../app/store'
 
 const PALETTES: Record<PaletteName, string[]> = {
@@ -51,8 +51,8 @@ export default function SpatialCanvas() {
       new ScatterplotLayer({
         id: 'spatial-layer',
         data: spatialPoints,
-        getPosition: (d: UmapPoint) => [d.sx!, d.sy!],
-        getFillColor: (d: UmapPoint) => colorForKey(d.cluster ?? '', paletteName),
+        getPosition: (d: any) => [d.sx, d.sy],
+        getFillColor: (d: any) => colorForKey(d.cluster ?? '', paletteName),
         getRadius: 6,
         radiusUnits: 'pixels',
         pickable: false
@@ -68,7 +68,7 @@ export default function SpatialCanvas() {
       <p className="muted">{spatialPoints.length.toLocaleString()} cells with spatial coordinates</p>
       <div style={{ height: 420, position: 'relative', borderRadius: 6, overflow: 'hidden' }}>
         <DeckGL
-          views={spatialView}
+          views={[spatialView]}
           initialViewState={initialViewState}
           controller
           layers={[layer]}

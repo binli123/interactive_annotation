@@ -78,6 +78,7 @@ class UmapResponse(BaseModel):
     highlighted_total: int | None = None
     highlighted_displayed: int | None = None
     points: list[UmapPoint]
+    view_token: str | None = None
 
 
 class GeneCatalogResponse(BaseModel):
@@ -89,6 +90,7 @@ class GeneCatalogResponse(BaseModel):
 class GeneExpressionRequest(BaseModel):
     gene_name: str
     indices: list[int] = Field(default_factory=list)
+    view_token: str | None = None
 
 
 class GeneExpressionValue(BaseModel):
@@ -99,7 +101,8 @@ class GeneExpressionValue(BaseModel):
 class GeneExpressionResponse(BaseModel):
     object_id: str
     gene_name: str
-    values: list[GeneExpressionValue]
+    values: list[GeneExpressionValue] = Field(default_factory=list)
+    ordered_values: list[float] | None = None
 
 
 class PointClusterRequest(BaseModel):

@@ -1,9 +1,5 @@
 import { useMemo } from 'react'
 import { useStore } from '../app/store'
-import type { PaletteName } from '../app/types'
-
-const paletteOptions: PaletteName[] = ['bright', 'earth', 'pastel']
-
 export default function SessionSidebar() {
   const state = useStore((store) => ({
     activeViewMode: store.activeViewMode,
@@ -47,11 +43,9 @@ export default function SessionSidebar() {
     pointSize: store.pointSize,
     pointOpacity: store.pointOpacity,
     polygonStrokeWidth: store.polygonStrokeWidth,
-    paletteName: store.paletteName,
     setPointSize: store.setPointSize,
     setPointOpacity: store.setPointOpacity,
     setPolygonStrokeWidth: store.setPolygonStrokeWidth,
-    setPaletteName: store.setPaletteName,
     flipHorizontal: store.flipHorizontal,
     flipVertical: store.flipVertical,
     setFlipHorizontal: store.setFlipHorizontal,
@@ -330,8 +324,8 @@ export default function SessionSidebar() {
           <span>Dot size</span>
           <input
             type="range"
-            min="0.5"
-            max="16"
+            min="0.2"
+            max="6.4"
             step="0.1"
             value={state.pointSize}
             onChange={(event) => state.setPointSize(Number(event.target.value))}
@@ -358,19 +352,6 @@ export default function SessionSidebar() {
             value={state.polygonStrokeWidth}
             onChange={(event) => state.setPolygonStrokeWidth(Number(event.target.value))}
           />
-        </label>
-        <label className="field">
-          <span>Palette</span>
-          <select
-            value={state.paletteName}
-            onChange={(event) => state.setPaletteName(event.target.value as PaletteName)}
-          >
-            {paletteOptions.map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
         </label>
         <label className="checkbox-row">
           <input

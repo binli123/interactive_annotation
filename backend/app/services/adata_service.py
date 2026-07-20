@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -21,10 +22,43 @@ from scipy import sparse
 from sklearn.neighbors import KNeighborsClassifier
 
 from app.core.config import settings
-from app.models.state import ObjectRecord
+from app.models.state import ObjectRecord, SessionState
 from app.services.polygon_ops import points_in_polygon
+from app.services.propagation import build_knn_graph
 from app.services.registry import registry
 from app.services.sampling import priority_stratified_sample_indices, stratified_sample_indices
+
+try:
+    from anndata.io import read_elem, write_elem
+except ImportError:  # anndata < 0.10.6
+    from anndata.experimental import read_elem, write_elem
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _h5_write_obs_column(f: h5py.File, column: str, values: np.ndarray) -> None:
+    """Write one obs column in place, appending it to obs's column-order if new."""
+    if column in f["obs"]:
+        del f["obs"][column]
+    if values.dtype.kind in ("f", "i", "u", "b"):
+        write_elem(f["obs"], column, values)
+    else:
+        write_elem(f["obs"], column, pd.array(np.asarray(values, dtype=object), dtype="string"))
+    column_order = [str(c) for c in f["obs"].attrs.get("column-order", [])]
+    if column not in column_order:
+        f["obs"].attrs["column-order"] = np.array(column_order + [column], dtype=object)
 
 
 def _obs_to_str_array(frame: pd.DataFrame, column: str, default: str = "") -> np.ndarray:
@@ -169,6 +203,321 @@ def _write_safe_plot_env() -> dict[str, Path]:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# h5py helpers: selective, memory-efficient reads from .h5ad files.
+# These read only what's requested — never the X matrix or full obsm.
+# ─────────────────────────────────────────────────────────────────────
+
+_H5_CLUSTER_EXCLUDED = {
+    "_index", "cell_id", "sample_id", "region", "run_id", "original_id",
+    "cell_index", "segmentation_method", "z_level", "barcode",
+    "x_centroid", "y_centroid",
+}
+_H5_CLUSTER_PREFERRED = [
+    "reannot_display_label", "reannot_label", "final_substate_refined",
+    "round2_substate", "round1_auto_substate", "celltypist_prediction",
+    "final_valid_lineage", "lineage",
+]
+_H5_QC_COLUMNS = {
+    "n_genes_by_counts", "total_counts", "pct_counts_mt",
+    "n_counts", "log1p_total_counts", "nCount_Xenium", "nFeature_Xenium",
+}
+
+
+def _h5_obs_col_names(h5: h5py.File) -> list[str]:
+    obs_grp = h5["obs"]
+    col_order = obs_grp.attrs.get("column-order", None)
+    if col_order is not None:
+        return [str(c) for c in col_order]
+    return [k for k in obs_grp.keys() if k != "__categories"]
+
+
+def _h5_n_obs(h5: h5py.File) -> int:
+    obs_grp = h5["obs"]
+    idx_col = str(obs_grp.attrs.get("_index", ""))
+    if idx_col and idx_col in obs_grp:
+        return int(obs_grp[idx_col].shape[0])
+    for k in obs_grp.keys():
+        item = obs_grp[k]
+        if isinstance(item, h5py.Dataset):
+            return int(item.shape[0])
+        if isinstance(item, h5py.Group) and "codes" in item:
+            return int(item["codes"].shape[0])
+    return 0
+
+
+def _h5_obs_names(h5: h5py.File) -> np.ndarray:
+    obs_grp = h5["obs"]
+    idx_col = str(obs_grp.attrs.get("_index", ""))
+    if not idx_col or idx_col not in obs_grp:
+        for k in obs_grp.keys():
+            if isinstance(obs_grp[k], h5py.Dataset):
+                idx_col = k
+                break
+    raw = obs_grp[idx_col][:]
+    return np.array([v.decode() if isinstance(v, bytes) else v for v in raw], dtype=object)
+
+
+def _h5_obs_col(h5: h5py.File, col: str, default: str | None = None) -> np.ndarray:
+    obs_grp = h5["obs"]
+    if col not in obs_grp:
+        if default is not None:
+            return np.full(_h5_n_obs(h5), default, dtype=object)
+        raise KeyError(f"Column '{col}' not found in obs")
+    item = obs_grp[col]
+    if isinstance(item, h5py.Group):
+        if "codes" not in item:
+            if "values" in item:
+                # Nullable array (e.g. nullable-string-array): {values, mask} with
+                # mask[i] True meaning the entry is missing/null.
+                raw = item["values"][:]
+                values_arr = np.array(
+                    [v.decode() if isinstance(v, bytes) else v for v in raw], dtype=object
+                )
+                if "mask" in item:
+                    missing = np.asarray(item["mask"][:], dtype=bool)
+                    values_arr[missing] = default if default is not None else ""
+                return values_arr
+            # Non-categorical group — fall back to default.
+            if default is not None:
+                return np.full(_h5_n_obs(h5), default, dtype=object)
+            raise KeyError(f"Column '{col}' has an unsupported structure")
+        codes = item["codes"][:]
+        cats_node = item.get("categories")
+        if isinstance(cats_node, h5py.Dataset):
+            cats_raw = cats_node[:]
+        elif isinstance(cats_node, h5py.Group) and "values" in cats_node:
+            # Newer AnnData nullable-string format: categories stored as {mask, values}.
+            cats_raw = cats_node["values"][:]
+        else:
+            if default is not None:
+                return np.full(_h5_n_obs(h5), default, dtype=object)
+            raise KeyError(f"Column '{col}' has an unsupported categorical structure")
+        cats = np.array([c.decode() if isinstance(c, bytes) else c for c in cats_raw], dtype=object)
+        valid = codes >= 0
+        result = np.empty(len(codes), dtype=object)
+        result[valid] = cats[codes[valid].astype(int)]
+        result[~valid] = ""
+        return result
+    data = item[:]
+    if data.dtype.kind == "S":
+        return np.array([v.decode() for v in data], dtype=object)
+    if data.dtype.kind == "O":
+        return np.array([v.decode() if isinstance(v, bytes) else v for v in data], dtype=object)
+    return data
+
+
+def _h5_obs_col_is_numeric(h5: h5py.File, col: str) -> bool:
+    obs_grp = h5["obs"]
+    if col not in obs_grp:
+        return False
+    item = obs_grp[col]
+    if isinstance(item, h5py.Group):
+        return False
+    return item.dtype.kind in ("f", "i", "u", "b")
+
+
+def _h5_obsm(h5: h5py.File, key: str) -> np.ndarray:
+    return np.asarray(h5["obsm"][key][:], dtype=np.float32)
+
+
+def _h5_var_names(h5: h5py.File) -> np.ndarray:
+    var_grp = h5["var"]
+    idx_col = str(var_grp.attrs.get("_index", ""))
+    if not idx_col or idx_col not in var_grp:
+        for k in var_grp.keys():
+            if isinstance(var_grp[k], h5py.Dataset):
+                idx_col = k
+                break
+    raw = var_grp[idx_col][:]
+    return np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw], dtype=object)
+
+
+def _h5_obsp_sparse(h5: h5py.File, key: str) -> sparse.spmatrix:
+    g = h5["obsp"][key]
+    data = g["data"][:]
+    indices_arr = g["indices"][:]
+    indptr = g["indptr"][:]
+    shape_attr = g.attrs.get("shape", None)
+    if shape_attr is not None:
+        shape = tuple(int(s) for s in shape_attr)
+    else:
+        n = len(indptr) - 1
+        shape = (n, n)
+    return sparse.csr_matrix((data, indices_arr, indptr), shape=shape)
+
+
+def _h5_gene_expression_for_indices(
+    h5: h5py.File, gene_name: str, sampled_indices: np.ndarray
+) -> np.ndarray | None:
+    """Read one gene's expression for a specific subset of cells only.
+    Uses per-row reads for CSR — total data read is tiny (sampled_cells × avg_nnz_per_cell).
+    Returns None if X is absent; raises ValueError if gene is not found."""
+    if "var" not in h5 or "X" not in h5:
+        return None
+    var_names = _h5_var_names(h5)
+    matches = np.where(var_names == gene_name)[0]
+    if len(matches) == 0:
+        raise ValueError(f"Gene not found in object: {gene_name}")
+    gene_idx = int(matches[0])
+    n_sampled = len(sampled_indices)
+    result = np.zeros(n_sampled, dtype=float)
+    x_node = h5["X"]
+
+    if isinstance(x_node, h5py.Dataset):
+        # Dense: fancy-index the rows we need
+        return np.asarray(x_node[sampled_indices.tolist(), gene_idx], dtype=float)
+
+    if isinstance(x_node, h5py.Group):
+        if "indptr" not in x_node or "indices" not in x_node or "data" not in x_node:
+            return None
+        encoding = str(
+            x_node.attrs.get("encoding-type", "") or x_node.attrs.get("h5sparse_format", "")
+        ).lower()
+
+        if "csc" in encoding:
+            # CSC: one slice covers the entire gene column
+            indptr = x_node["indptr"][:]
+            col_data = x_node["data"][indptr[gene_idx] : indptr[gene_idx + 1]]
+            col_rows = x_node["indices"][indptr[gene_idx] : indptr[gene_idx + 1]]
+            row_to_val = dict(zip(col_rows.tolist(), col_data.tolist()))
+            for i, cell_idx in enumerate(sampled_indices.tolist()):
+                result[i] = float(row_to_val.get(int(cell_idx), 0.0))
+            return result
+
+        # CSR: load indptr (22 MB for 2.8M cells), then read each sampled row's slice.
+        # Total data read = n_sampled × avg_nnz_per_cell ≈ 10k × 150 entries = 12 MB.
+        indptr = x_node["indptr"][:]
+        sort_order = np.argsort(sampled_indices)
+        sorted_cell_indices = sampled_indices[sort_order]
+        for rank, cell_idx in enumerate(sorted_cell_indices.tolist()):
+            start = int(indptr[cell_idx])
+            end = int(indptr[cell_idx + 1])
+            if end > start:
+                cell_cols = x_node["indices"][start:end]
+                hit = np.where(cell_cols == gene_idx)[0]
+                if len(hit):
+                    result[sort_order[rank]] = float(x_node["data"][int(start + hit[0])])
+        return result
+
+    return None
+
+
+def _h5_build_view_submatrix(
+    h5: h5py.File, sampled_indices: np.ndarray
+) -> tuple[sparse.csc_matrix, np.ndarray] | None:
+    """Build a CSC submatrix for the sampled cells using just 2 h5py fancy-index reads.
+
+    Old approach: 50k × 2 individual h5py slice reads = ~100k h5py calls.
+    New approach: build flat_positions (vectorized numpy), then read indices and data
+    arrays in ONE h5py call each. Convert the resulting CSR submatrix to CSC so that
+    any gene column extraction is an instant O(nnz_in_gene) numpy operation.
+
+    Memory: ~120MB peak during build; ~60MB stored per view (50k cells × ~150 entries).
+    """
+    if "X" not in h5 or "var" not in h5:
+        return None
+    x_node = h5["X"]
+    var_names = _h5_var_names(h5)
+    n_genes = len(var_names)
+    n_sampled = len(sampled_indices)
+
+    if isinstance(x_node, h5py.Dataset):
+        # Dense X: read the sub-rows directly.
+        sub = np.asarray(x_node[sorted(sampled_indices.tolist()), :], dtype=np.float32)
+        # re-order rows to match original sampled_indices order
+        inv = np.argsort(np.argsort(sampled_indices))
+        return sparse.csc_matrix(sub[inv]), var_names
+
+    if not isinstance(x_node, h5py.Group):
+        return None
+    if "indptr" not in x_node or "indices" not in x_node or "data" not in x_node:
+        return None
+
+    encoding = str(
+        x_node.attrs.get("encoding-type", "") or x_node.attrs.get("h5sparse_format", "")
+    ).lower()
+
+    if "csc" in encoding:
+        # CSC: per-gene column reads are already cheap; submatrix not needed.
+        return None
+
+    # CSR path: sort cells for sequential h5py access
+    sort_order = np.argsort(sampled_indices)
+    sorted_cell_indices = sampled_indices[sort_order]
+
+    indptr = x_node["indptr"][:]
+    starts = indptr[sorted_cell_indices].astype(np.int64)
+    ends = indptr[sorted_cell_indices + 1].astype(np.int64)
+    row_lengths = ends - starts
+    total_nnz = int(row_lengths.sum())
+
+    if total_nnz == 0:
+        return sparse.csc_matrix((n_sampled, n_genes), dtype=np.float32), var_names
+
+    # Build flat file-positions for all needed entries (vectorized, no Python loops).
+    cumlen = np.zeros(n_sampled + 1, dtype=np.int64)
+    np.cumsum(row_lengths, out=cumlen[1:])
+    inner = np.arange(total_nnz, dtype=np.int64)
+    inner -= np.repeat(cumlen[:-1], row_lengths)
+    flat_positions = np.repeat(starts, row_lengths) + inner  # sorted ↑ → efficient HDF5 read
+
+    # TWO h5py fancy-index reads instead of n_sampled×2 slice reads.
+    all_col_indices = x_node["indices"][flat_positions]
+    all_data = x_node["data"][flat_positions].astype(np.float32)
+
+    # Row indices in original (unsorted) order
+    sorted_row_ids = np.repeat(np.arange(n_sampled, dtype=np.int32), row_lengths)
+    orig_row_ids = sort_order[sorted_row_ids]
+
+    csr = sparse.csr_matrix(
+        (all_data, (orig_row_ids, all_col_indices.astype(np.int32))),
+        shape=(n_sampled, n_genes),
+    )
+    return csr.tocsc(), var_names
+
+
+def _h5_category_count(item: h5py.Group) -> int:
+    """Count categories for a categorical obs Group, tolerating both plain-Dataset
+    and newer nullable-string-array ({mask, values}) category encodings."""
+    cats_node = item.get("categories")
+    if isinstance(cats_node, h5py.Dataset):
+        return int(cats_node.shape[0])
+    if isinstance(cats_node, h5py.Group) and "values" in cats_node:
+        return int(cats_node["values"].shape[0])
+    return 0
+
+
+def _h5_cluster_key_candidates(h5: h5py.File, obs_cols: list[str]) -> list[str]:
+    obs_grp = h5["obs"]
+    candidates: set[str] = set()
+    for col in obs_cols:
+        if col in _H5_CLUSTER_EXCLUDED:
+            continue
+        if col not in obs_grp:
+            continue
+        item = obs_grp[col]
+        if col.startswith("leiden_") or col in _H5_CLUSTER_PREFERRED:
+            candidates.add(col)
+            continue
+        if isinstance(item, h5py.Group) and "categories" in item:
+            n_cats = _h5_category_count(item)
+            if 2 <= n_cats <= 256:
+                candidates.add(col)
+        # non-categorical strings: skip to avoid expensive unique-count load
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for col in _H5_CLUSTER_PREFERRED:
+        if col in candidates and col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    for col in sorted(candidates):
+        if col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    return ordered
+
+
 def _cluster_key_candidates(frame: pd.DataFrame) -> list[str]:
     excluded = {
         "_index",
@@ -229,6 +578,22 @@ class AnnDataService:
         self.max_cached_objects = max_cached_objects
         self._cache: OrderedDict[str, ad.AnnData] = OrderedDict()
         self._cell_id_cache: dict[str, np.ndarray] = {}
+        # Gene expression cache: keyed by "{object_id}:{indices_hash}" → {gene_name: values_array}
+        # Evicted automatically when the displayed point set changes (new sampling or object switch).
+        self._gene_expr_cache: dict[str, np.ndarray] = {}
+        self._gene_expr_cache_slot: str | None = None  # current slot key
+        # View-token store: maps token → sampled indices array so gene requests don't re-send indices.
+        self._view_indices: dict[str, np.ndarray] = {}
+        # Submatrix cache: full CSC sparse matrix for the currently displayed cells.
+        # Built on first gene query; makes all subsequent gene queries instant (column extraction only).
+        # Only one view is cached at a time — evicted when the displayed point set changes.
+        self._view_submatrix_token: str | None = None
+        self._view_submatrix_data: tuple | None = None  # (csc_matrix, var_names)
+        self._view_submatrix_lock = threading.Lock()
+        # KNN propagation graph cache: keyed by "{object_id}:{n_neighbors}:{pca_key}".
+        # Building this graph is the expensive part of whole_lineage propagation — cache
+        # it so repeated propagate() calls (tuning thresholds, re-running) are instant.
+        self._graph_cache: dict[str, sparse.spmatrix] = {}
 
     def _touch(self, object_id: str, adata: ad.AnnData) -> ad.AnnData:
         self._cache[object_id] = adata
@@ -240,11 +605,16 @@ class AnnDataService:
                 evicted.file.close()
         return adata
 
+    def _evict_graph_cache(self, object_id: str) -> None:
+        for key in [k for k in self._graph_cache if k.startswith(f"{object_id}:")]:
+            self._graph_cache.pop(key, None)
+
     def replace_cached(self, object_id: str, adata: ad.AnnData) -> ad.AnnData:
         cached = self._cache.pop(object_id, None)
         if cached is not None and getattr(cached, "isbacked", False):
             cached.file.close()
         self._cell_id_cache.pop(object_id, None)
+        self._evict_graph_cache(object_id)
         return self._touch(object_id, adata)
 
     def get_adata(self, record: ObjectRecord) -> ad.AnnData:
@@ -266,16 +636,15 @@ class AnnDataService:
         if cached is not None and getattr(cached, "isbacked", False):
             cached.file.close()
         self._cell_id_cache.pop(object_id, None)
+        self._evict_graph_cache(object_id)
 
     def _get_cell_ids(self, record: ObjectRecord) -> np.ndarray:
         cached = self._cell_id_cache.get(record.object_id)
         if cached is not None:
             return cached
-        adata = self.get_adata(record)
-        if "cell_id" in adata.obs.columns:
-            cell_ids = _obs_to_str_array(adata.obs, "cell_id")
-        else:
-            cell_ids = adata.obs_names.to_numpy(dtype=object)
+        with h5py.File(record.object_path, "r") as f:
+            obs_cols = _h5_obs_col_names(f)
+            cell_ids = _h5_obs_col(f, "cell_id") if "cell_id" in obs_cols else _h5_obs_names(f)
         normalized = np.asarray(cell_ids, dtype=object).astype(str, copy=False)
         self._cell_id_cache[record.object_id] = normalized
         return normalized
@@ -689,42 +1058,50 @@ class AnnDataService:
         return adata
 
     def get_metadata(self, record: ObjectRecord) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        embedding_keys = sorted(list(adata.obsm.keys()))
+        with h5py.File(record.object_path, "r") as f:
+            embedding_keys = sorted(f["obsm"].keys()) if "obsm" in f else []
+            obsp_keys = list(f["obsp"].keys()) if "obsp" in f else []
+            obs_cols = _h5_obs_col_names(f)
+            n_obs = _h5_n_obs(f)
+            n_vars = len(_h5_var_names(f)) if "var" in f else 0
+            cluster_keys = _h5_cluster_key_candidates(f, obs_cols)
+            has_spatial = "spatial" in (f["obsm"] if "obsm" in f else {})
+
         if not embedding_keys:
             raise ValueError(
                 f"Object has no embeddings available for viewing: {record.object_path}. "
                 "Use a lineage object with saved UMAP coordinates."
             )
-        cluster_keys = _cluster_key_candidates(adata.obs)
-        pca_keys = [key for key in embedding_keys if "pca" in key.lower()]
-        if "X_umap" in embedding_keys:
-            default_embedding = "X_umap"
-        elif "X_umap_lineage" in embedding_keys:
-            default_embedding = "X_umap_lineage"
-        else:
-            default_embedding = embedding_keys[0]
-        default_cluster = next((key for key in ("reannot_label", "reannot_display_label") if key in cluster_keys), None)
+        pca_keys = [k for k in embedding_keys if "pca" in k.lower()]
+        default_embedding = (
+            "X_umap" if "X_umap" in embedding_keys
+            else "X_umap_lineage" if "X_umap_lineage" in embedding_keys
+            else embedding_keys[0]
+        )
+        default_cluster = next(
+            (k for k in ("reannot_label", "reannot_display_label") if k in cluster_keys), None
+        )
         if default_cluster is None and record.lineage_name == "Global" and "final_valid_lineage" in cluster_keys:
             default_cluster = "final_valid_lineage"
         if default_cluster is None:
             default_cluster = cluster_keys[0] if cluster_keys else None
+        sample_cols = [c for c in ("sample_id", "region", "lineage", "final_valid_lineage") if c in obs_cols]
         return {
             "object_id": record.object_id,
             "lineage_name": record.lineage_name,
             "object_path": str(record.object_path),
-            "shape": (int(adata.n_obs), int(adata.n_vars)),
+            "shape": (int(n_obs), int(n_vars)),
             "cluster_keys": cluster_keys,
             "embedding_keys": embedding_keys,
             "pca_keys": pca_keys,
             "default_embedding_key": default_embedding,
             "default_cluster_key": default_cluster,
-            "has_connectivities": "lineage_connectivities" in adata.obsp,
-            "has_distances": "lineage_distances" in adata.obsp,
-            "has_spatial": "spatial" in adata.obsm,
+            "has_connectivities": "lineage_connectivities" in obsp_keys,
+            "has_distances": "lineage_distances" in obsp_keys,
+            "has_spatial": has_spatial,
             "summary_resolution_trials": record.resolution_trials,
-            "obs_columns": list(adata.obs.columns),
-            "sample_columns": [col for col in ("sample_id", "region", "lineage", "final_valid_lineage") if col in adata.obs.columns],
+            "obs_columns": obs_cols,
+            "sample_columns": sample_cols,
             "manifest": record.manifest,
         }
 
@@ -816,38 +1193,82 @@ class AnnDataService:
         max_per_cluster: int,
         random_seed: int,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
-        clusters = (
-            _obs_to_str_array(adata.obs, cluster_key, default="all")
-            if cluster_key
-            else np.full(adata.n_obs, "all", dtype=object)
-        )
-        indices = stratified_sample_indices(
-            labels=clusters.astype(str),
-            max_points=max_points,
-            min_per_cluster=min_per_cluster,
-            max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
-            random_seed=random_seed,
-        )
-        payload = self._point_payload(
-            adata=adata,
-            record=record,
-            indices=indices,
-            coords=coords,
-            clusters=clusters,
-            gene_name=gene_name,
-        )
+        _LABEL_COLS = ("reannot_display_label", "reannot_label", "current_label", "celltypist_label")
+        _SCORE_COLS = ("reannot_confidence", "current_score", "celltypist_confidence")
+        with h5py.File(record.object_path, "r") as f:
+            coords = _h5_obsm(f, embedding_key)[:, :2]
+            n_obs = coords.shape[0]
+            obs_grp_keys = set(f["obs"].keys())
+            clusters = (
+                _h5_obs_col(f, cluster_key, default="all")
+                if cluster_key and cluster_key in obs_grp_keys
+                else np.full(n_obs, "all", dtype=object)
+            )
+            label_col = next((c for c in _LABEL_COLS if c in obs_grp_keys), None)
+            current_labels = _h5_obs_col(f, label_col, default="") if label_col else None
+            score_col = next((c for c in _SCORE_COLS if c in obs_grp_keys), None)
+            current_scores = np.asarray(_h5_obs_col(f, score_col), dtype=float) if score_col else None
+            sample_id_arr = _h5_obs_col(f, "sample_id", default="") if "sample_id" in obs_grp_keys else None
+            region_arr = _h5_obs_col(f, "region", default="") if "region" in obs_grp_keys else None
+            lineage_arr = _h5_obs_col(f, "lineage", default="") if "lineage" in obs_grp_keys else None
+            has_spatial = "obsm" in f and "spatial" in f["obsm"]
+            spatial_coords = _h5_obsm(f, "spatial")[:, :2] if has_spatial else None
+            obs_names_arr = _h5_obs_names(f)
 
-        return {
-            **payload,
+            # Sample first so gene expression reads only the displayed rows
+            indices = stratified_sample_indices(
+                labels=clusters.astype(str),
+                max_points=max_points,
+                min_per_cluster=min_per_cluster,
+                max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
+                random_seed=random_seed,
+            )
+
+            gene_expr: np.ndarray | None = None
+            gene_expr_warning: str | None = None
+            if gene_name:
+                try:
+                    gene_expr = _h5_gene_expression_for_indices(f, gene_name, indices)
+                except Exception as exc:
+                    gene_expr_warning = str(exc)
+        cell_ids = self._get_cell_ids(record)
+        points = []
+        for local_pos, obs_idx in enumerate(indices.tolist()):
+            score_val = float(current_scores[obs_idx]) if current_scores is not None else np.nan
+            # gene_expr is indexed by local_pos (one entry per sampled cell, not per all cells)
+            gene_val = float(gene_expr[local_pos]) if gene_expr is not None else np.nan
+            label_val = str(current_labels[obs_idx]) if current_labels is not None else ""
+            points.append({
+                "index": int(obs_idx),
+                "obs_name": str(obs_names_arr[obs_idx]),
+                "cell_id": str(cell_ids[obs_idx]),
+                "x": float(coords[obs_idx, 0]),
+                "y": float(coords[obs_idx, 1]),
+                "cluster": str(clusters[obs_idx]),
+                "sample_id": str(sample_id_arr[obs_idx]) if sample_id_arr is not None else None,
+                "region": str(region_arr[obs_idx]) if region_arr is not None else None,
+                "lineage": str(lineage_arr[obs_idx]) if lineage_arr is not None else None,
+                "current_label": label_val if label_val else None,
+                "current_score": None if np.isnan(score_val) else score_val,
+                "gene_expression": None if np.isnan(gene_val) else gene_val,
+                "sx": float(spatial_coords[obs_idx, 0]) if spatial_coords is not None else None,
+                "sy": float(spatial_coords[obs_idx, 1]) if spatial_coords is not None else None,
+            })
+        view_token = f"{record.object_id}:{hash(indices.tobytes())}"
+        self._view_indices[view_token] = indices
+        result: dict[str, Any] = {
+            "object_id": record.object_id,
+            "points": points,
             "embedding_key": embedding_key,
             "cluster_key": cluster_key,
             "gene_name": gene_name,
-            "total_cells": int(adata.n_obs),
+            "total_cells": int(n_obs),
             "displayed_cells": int(indices.size),
-            "points": payload["points"],
+            "view_token": view_token,
         }
+        if gene_expr_warning:
+            result["gene_expression_warning"] = gene_expr_warning
+        return result
 
     def get_umap_points_with_highlight(
         self,
@@ -860,13 +1281,28 @@ class AnnDataService:
         max_per_cluster: int,
         random_seed: int,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
-        clusters = (
-            _obs_to_str_array(adata.obs, cluster_key, default="all")
-            if cluster_key
-            else np.full(adata.n_obs, "all", dtype=object)
-        )
+        _LABEL_COLS = ("reannot_display_label", "reannot_label", "current_label", "celltypist_label")
+        _SCORE_COLS = ("reannot_confidence", "current_score", "celltypist_confidence")
+        with h5py.File(record.object_path, "r") as f:
+            coords = _h5_obsm(f, embedding_key)[:, :2]
+            n_obs = coords.shape[0]
+            obs_grp_keys = set(f["obs"].keys())
+            clusters = (
+                _h5_obs_col(f, cluster_key, default="all")
+                if cluster_key and cluster_key in obs_grp_keys
+                else np.full(n_obs, "all", dtype=object)
+            )
+            label_col = next((c for c in _LABEL_COLS if c in obs_grp_keys), None)
+            current_labels = _h5_obs_col(f, label_col, default="") if label_col else None
+            score_col = next((c for c in _SCORE_COLS if c in obs_grp_keys), None)
+            current_scores = np.asarray(_h5_obs_col(f, score_col), dtype=float) if score_col else None
+            sample_id_arr = _h5_obs_col(f, "sample_id", default="") if "sample_id" in obs_grp_keys else None
+            region_arr = _h5_obs_col(f, "region", default="") if "region" in obs_grp_keys else None
+            lineage_arr = _h5_obs_col(f, "lineage", default="") if "lineage" in obs_grp_keys else None
+            has_spatial = "obsm" in f and "spatial" in f["obsm"]
+            spatial_coords = _h5_obsm(f, "spatial")[:, :2] if has_spatial else None
+            obs_names_arr = _h5_obs_names(f)
+
         cell_ids = self._get_cell_ids(record)
         highlight_mask = np.isin(cell_ids, list(highlight_cell_ids))
         indices = priority_stratified_sample_indices(
@@ -877,33 +1313,171 @@ class AnnDataService:
             max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
             random_seed=random_seed,
         )
-        payload = self._point_payload(
-            adata=adata,
-            record=record,
-            indices=indices,
-            coords=coords,
-            clusters=clusters,
-            gene_name=None,
-            highlight_mask=highlight_mask,
-        )
+        displayed_highlight = highlight_mask[indices]
+        points = []
+        for obs_idx in indices.tolist():
+            score_val = float(current_scores[obs_idx]) if current_scores is not None else np.nan
+            label_val = str(current_labels[obs_idx]) if current_labels is not None else ""
+            points.append({
+                "index": int(obs_idx),
+                "obs_name": str(obs_names_arr[obs_idx]),
+                "cell_id": str(cell_ids[obs_idx]),
+                "x": float(coords[obs_idx, 0]),
+                "y": float(coords[obs_idx, 1]),
+                "cluster": str(clusters[obs_idx]),
+                "sample_id": str(sample_id_arr[obs_idx]) if sample_id_arr is not None else None,
+                "region": str(region_arr[obs_idx]) if region_arr is not None else None,
+                "lineage": str(lineage_arr[obs_idx]) if lineage_arr is not None else None,
+                "current_label": label_val if label_val else None,
+                "current_score": None if np.isnan(score_val) else score_val,
+                "gene_expression": None,
+                "sx": float(spatial_coords[obs_idx, 0]) if spatial_coords is not None else None,
+                "sy": float(spatial_coords[obs_idx, 1]) if spatial_coords is not None else None,
+                "is_highlighted": bool(highlight_mask[obs_idx]),
+            })
+        view_token = f"{record.object_id}:{hash(indices.tobytes())}"
+        self._view_indices[view_token] = indices
         return {
-            **payload,
+            "object_id": record.object_id,
+            "points": points,
             "embedding_key": embedding_key,
             "cluster_key": cluster_key,
             "gene_name": None,
-            "total_cells": int(adata.n_obs),
+            "total_cells": int(n_obs),
             "displayed_cells": int(indices.size),
-            "points": payload["points"],
-            "highlighted_total": payload["highlighted_total"],
-            "highlighted_displayed": payload["highlighted_displayed"],
+            "highlighted_total": int(highlight_mask.sum()),
+            "highlighted_displayed": int(displayed_highlight.sum()),
+            "view_token": view_token,
+        }
+
+    def get_combined_global_umap_points(
+        self,
+        global_record: ObjectRecord,
+        lineage_records: list[ObjectRecord],
+        embedding_key: str,
+        cluster_key: str | None,
+        max_points: int,
+        min_per_cluster: int,
+        max_per_cluster: int,
+        random_seed: int,
+    ) -> dict[str, Any]:
+        """Build the global view from the union of each lineage object's own sampled
+        subset, rather than sampling directly from the global object. Each lineage
+        contributes an equal share of `max_points`, stratified by its own cluster
+        labels; the resulting cell_ids are then matched back to their rows in the
+        global object (which holds the shared embedding all lineages are plotted in).
+        """
+        _LABEL_COLS = ("reannot_display_label", "reannot_label", "current_label", "celltypist_label")
+        _SCORE_COLS = ("reannot_confidence", "current_score", "celltypist_confidence")
+
+        valid_records = [r for r in lineage_records if r.is_valid]
+        per_lineage_quota = max(1, int(max_points) // max(1, len(valid_records)))
+
+        combined_cell_ids: list[np.ndarray] = []
+        for record in valid_records:
+            try:
+                with h5py.File(record.object_path, "r") as f:
+                    n_obs = _h5_n_obs(f)
+                    if n_obs == 0:
+                        continue
+                    obs_cols = _h5_obs_col_names(f)
+                    candidates = _h5_cluster_key_candidates(f, obs_cols)
+                    lineage_cluster_key = next(
+                        (c for c in ("reannot_label", *candidates) if c in obs_cols), None
+                    )
+                    cluster_values = (
+                        _h5_obs_col(f, lineage_cluster_key, default="all")
+                        if lineage_cluster_key
+                        else np.full(n_obs, "all", dtype=object)
+                    )
+                cell_ids = self._get_cell_ids(record)
+                indices = stratified_sample_indices(
+                    labels=cluster_values.astype(str),
+                    max_points=per_lineage_quota,
+                    min_per_cluster=min_per_cluster,
+                    max_per_cluster=max_per_cluster if max_per_cluster > 0 else None,
+                    random_seed=random_seed,
+                )
+                combined_cell_ids.append(cell_ids[indices])
+            except Exception:
+                # Skip lineage objects that can't be sampled rather than failing the whole view.
+                continue
+
+        combined_ids = (
+            np.concatenate(combined_cell_ids) if combined_cell_ids else np.array([], dtype=object)
+        )
+
+        with h5py.File(global_record.object_path, "r") as f:
+            coords = _h5_obsm(f, embedding_key)[:, :2]
+            n_obs = coords.shape[0]
+            obs_grp_keys = set(f["obs"].keys())
+            global_cell_ids = self._get_cell_ids(global_record)
+            clusters = (
+                _h5_obs_col(f, cluster_key, default="all")
+                if cluster_key and cluster_key in obs_grp_keys
+                else np.full(n_obs, "all", dtype=object)
+            )
+            label_col = next((c for c in _LABEL_COLS if c in obs_grp_keys), None)
+            current_labels = _h5_obs_col(f, label_col, default="") if label_col else None
+            score_col = next((c for c in _SCORE_COLS if c in obs_grp_keys), None)
+            current_scores = np.asarray(_h5_obs_col(f, score_col), dtype=float) if score_col else None
+            sample_id_arr = _h5_obs_col(f, "sample_id", default="") if "sample_id" in obs_grp_keys else None
+            region_arr = _h5_obs_col(f, "region", default="") if "region" in obs_grp_keys else None
+            lineage_arr = _h5_obs_col(f, "lineage", default="") if "lineage" in obs_grp_keys else None
+            has_spatial = "obsm" in f and "spatial" in f["obsm"]
+            spatial_coords = _h5_obsm(f, "spatial")[:, :2] if has_spatial else None
+            obs_names_arr = _h5_obs_names(f)
+
+        # cell_id -> global row-index lookup. cell_id is not guaranteed unique in the
+        # global object (e.g. reused barcodes across source samples), so map each id
+        # to the position of its first occurrence rather than relying on a unique index.
+        unique_ids, first_positions = np.unique(global_cell_ids, return_index=True)
+        id_to_position = dict(zip(unique_ids.tolist(), first_positions.tolist()))
+        matched = np.unique(np.array(
+            [id_to_position[cid] for cid in combined_ids.tolist() if cid in id_to_position],
+            dtype=int,
+        )) if combined_ids.size else np.array([], dtype=int)
+
+        points = []
+        for obs_idx in matched.tolist():
+            score_val = float(current_scores[obs_idx]) if current_scores is not None else np.nan
+            label_val = str(current_labels[obs_idx]) if current_labels is not None else ""
+            points.append({
+                "index": int(obs_idx),
+                "obs_name": str(obs_names_arr[obs_idx]),
+                "cell_id": str(global_cell_ids[obs_idx]),
+                "x": float(coords[obs_idx, 0]),
+                "y": float(coords[obs_idx, 1]),
+                "cluster": str(clusters[obs_idx]),
+                "sample_id": str(sample_id_arr[obs_idx]) if sample_id_arr is not None else None,
+                "region": str(region_arr[obs_idx]) if region_arr is not None else None,
+                "lineage": str(lineage_arr[obs_idx]) if lineage_arr is not None else None,
+                "current_label": label_val if label_val else None,
+                "current_score": None if np.isnan(score_val) else score_val,
+                "gene_expression": None,
+                "sx": float(spatial_coords[obs_idx, 0]) if spatial_coords is not None else None,
+                "sy": float(spatial_coords[obs_idx, 1]) if spatial_coords is not None else None,
+            })
+        view_token = f"{global_record.object_id}:{hash(matched.tobytes())}"
+        self._view_indices[view_token] = matched
+        return {
+            "object_id": global_record.object_id,
+            "points": points,
+            "embedding_key": embedding_key,
+            "cluster_key": cluster_key,
+            "gene_name": None,
+            "total_cells": int(n_obs),
+            "displayed_cells": int(matched.size),
+            "view_token": view_token,
         }
 
     def get_gene_catalog(self, record: ObjectRecord) -> dict[str, Any]:
-        adata = self.get_adata(record)
+        with h5py.File(record.object_path, "r") as f:
+            genes = _h5_var_names(f)
         return {
             "object_id": record.object_id,
             "object_path": str(record.object_path),
-            "genes": [str(gene) for gene in adata.var_names.tolist()],
+            "genes": [str(g) for g in genes.tolist()],
         }
 
     def _display_mapping(self, adata: ad.AnnData, cluster_key: str) -> dict[str, str]:
@@ -936,26 +1510,107 @@ class AnnDataService:
             values = np.asarray(column[indices]).ravel()
         return values.astype(float, copy=False)
 
+    def _ensure_view_submatrix(self, record: ObjectRecord, view_token: str, index_array: np.ndarray) -> None:
+        """Build (or reuse) the cached per-view CSC submatrix for `view_token`.
+
+        Guarded by a lock since this mutates the single shared cache slot and can
+        now be triggered either lazily (first gene request) or eagerly via
+        `prewarm_view_submatrix` from a background task right after a view loads.
+        """
+        with self._view_submatrix_lock:
+            if self._view_submatrix_token == view_token:
+                return
+            self._view_submatrix_token = view_token
+            self._view_submatrix_data = None
+            with h5py.File(record.object_path, "r") as f:
+                self._view_submatrix_data = _h5_build_view_submatrix(f, index_array)
+
+    def prewarm_view_submatrix(self, record: ObjectRecord, view_token: str) -> None:
+        """Eagerly build the gene-expression submatrix for a just-loaded view.
+
+        Scheduled as a background task right after /umap responds, so the
+        multi-second submatrix build (dominated by two large h5py fancy-index
+        reads) usually finishes while the user is still looking at the plot,
+        before they pick a gene to color by.
+        """
+        index_array = self._view_indices.get(view_token)
+        if index_array is None or index_array.size == 0:
+            return
+        try:
+            self._ensure_view_submatrix(record, view_token, index_array)
+        except Exception:
+            # Best-effort — the lazy path in get_gene_expression_values will retry.
+            pass
+
     def get_gene_expression_values(
         self,
         record: ObjectRecord,
         gene_name: str,
         indices: list[int],
+        view_token: str | None = None,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        index_array = np.asarray(indices, dtype=int)
+        # Prefer view_token lookup (no large payload) over caller-supplied indices.
+        if view_token and view_token in self._view_indices:
+            index_array = self._view_indices[view_token]
+        else:
+            index_array = np.asarray(indices, dtype=int)
+            view_token = None  # token was unknown; fall back to index-based response
+
         if index_array.size == 0:
-            return {"object_id": record.object_id, "gene_name": gene_name, "values": []}
-        if int(index_array.min()) < 0 or int(index_array.max()) >= adata.n_obs:
-            raise ValueError("Requested point indices are out of bounds for the current object.")
-        values = self._extract_gene_expression(adata, gene_name, index_array)
+            return {"object_id": record.object_id, "gene_name": gene_name, "values": [], "ordered_values": []}
+
+        # --- Fast path: use pre-built CSC submatrix (all genes, sampled cells) ---
+        # The submatrix is built once per view on the first gene request, then all
+        # subsequent gene queries are instant column extractions (no h5py I/O).
+        if view_token:
+            self._ensure_view_submatrix(record, view_token, index_array)
+
+            if self._view_submatrix_data is not None:
+                matrix, var_names = self._view_submatrix_data
+                matches = np.where(var_names == gene_name)[0]
+                if len(matches) == 0:
+                    raise ValueError(f"Gene not found in object: {gene_name}")
+                col = matrix[:, int(matches[0])]
+                values = np.asarray(col.todense(), dtype=float).ravel()
+                return {
+                    "object_id": record.object_id,
+                    "gene_name": gene_name,
+                    "values": [],
+                    "ordered_values": values.tolist(),
+                }
+
+        # --- Fallback path: per-gene h5py read with gene-level cache ---
+        slot = f"{record.object_id}:{hash(index_array.tobytes())}"
+        if self._gene_expr_cache_slot != slot:
+            self._gene_expr_cache.clear()
+            self._gene_expr_cache_slot = slot
+
+        cache_key = f"{slot}:{gene_name}"
+        if cache_key not in self._gene_expr_cache:
+            with h5py.File(record.object_path, "r") as f:
+                n_obs = _h5_n_obs(f)
+                if int(index_array.min()) < 0 or int(index_array.max()) >= n_obs:
+                    raise ValueError("Requested point indices are out of bounds for the current object.")
+                vals = _h5_gene_expression_for_indices(f, gene_name, index_array)
+            self._gene_expr_cache[cache_key] = vals if vals is not None else np.zeros(len(index_array), dtype=float)
+
+        values = self._gene_expr_cache[cache_key]
+
+        if view_token:
+            return {
+                "object_id": record.object_id,
+                "gene_name": gene_name,
+                "values": [],
+                "ordered_values": values.tolist(),
+            }
         return {
             "object_id": record.object_id,
             "gene_name": gene_name,
             "values": [
-                {"index": int(index), "value": float(value)}
-                for index, value in zip(index_array.tolist(), values.tolist(), strict=False)
+                {"index": int(idx), "value": float(val)}
+                for idx, val in zip(index_array.tolist(), values.tolist(), strict=False)
             ],
+            "ordered_values": None,
         }
 
     def get_point_cluster_values(
@@ -964,21 +1619,22 @@ class AnnDataService:
         cluster_key: str,
         indices: list[int],
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        if cluster_key not in adata.obs.columns:
-            raise ValueError(f"Cluster key not found in obs: {cluster_key}")
         index_array = np.asarray(indices, dtype=int)
         if index_array.size == 0:
             return {"object_id": record.object_id, "cluster_key": cluster_key, "values": []}
-        if int(index_array.min()) < 0 or int(index_array.max()) >= adata.n_obs:
-            raise ValueError("Requested point indices are out of bounds for the current object.")
-        cluster_values = _obs_to_str_array(adata.obs, cluster_key, default="NA")[index_array]
+        with h5py.File(record.object_path, "r") as f:
+            if cluster_key not in f["obs"]:
+                raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+            n_obs = _h5_n_obs(f)
+            if int(index_array.min()) < 0 or int(index_array.max()) >= n_obs:
+                raise ValueError("Requested point indices are out of bounds for the current object.")
+            cluster_values = _h5_obs_col(f, cluster_key, default="NA")[index_array]
         return {
             "object_id": record.object_id,
             "cluster_key": cluster_key,
             "values": [
-                {"index": int(index), "cluster": str(cluster)}
-                for index, cluster in zip(index_array.tolist(), cluster_values.tolist(), strict=False)
+                {"index": int(idx), "cluster": str(clus)}
+                for idx, clus in zip(index_array.tolist(), cluster_values.tolist(), strict=False)
             ],
         }
 
@@ -1244,10 +1900,10 @@ class AnnDataService:
         cluster_key: str,
         cluster_id: str,
     ) -> set[str]:
-        adata = self.get_adata(record)
-        if cluster_key not in adata.obs.columns:
-            raise ValueError(f"Cluster key not found in obs: {cluster_key}")
-        cluster_values = _obs_to_str_array(adata.obs, cluster_key, default="NA")
+        with h5py.File(record.object_path, "r") as f:
+            if cluster_key not in f["obs"]:
+                raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+            cluster_values = _h5_obs_col(f, cluster_key, default="NA")
         mask = cluster_values.astype(str) == str(cluster_id)
         if not bool(mask.any()):
             raise ValueError(f"Cluster not found in {cluster_key}: {cluster_id}")
@@ -1529,69 +2185,111 @@ class AnnDataService:
         polygons: list[dict[str, Any]],
         cluster_key: str | None,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        coords = np.asarray(adata.obsm[embedding_key])[:, :2]
-        cluster_values = (
-            _obs_to_str_array(adata.obs, cluster_key, default="all")
-            if cluster_key
-            else np.full(adata.n_obs, "all", dtype=object)
-        )
-        selected_mask = np.zeros(adata.n_obs, dtype=bool)
+        with h5py.File(record.object_path, "r") as f:
+            coords = _h5_obsm(f, embedding_key)[:, :2]
+            n_obs = coords.shape[0]
+            obs_cols = _h5_obs_col_names(f)
+            obs_grp_keys = set(f["obs"].keys())
+            cluster_values = (
+                _h5_obs_col(f, cluster_key, default="all")
+                if cluster_key and cluster_key in obs_grp_keys
+                else np.full(n_obs, "all", dtype=object)
+            )
+            cell_ids_arr = (
+                _h5_obs_col(f, "cell_id")
+                if "cell_id" in obs_cols
+                else _h5_obs_names(f)
+            )
+
+        selected_mask = np.zeros(n_obs, dtype=bool)
         polygon_summaries: list[dict[str, Any]] = []
         for polygon in polygons:
             polygon_mask = points_in_polygon(coords, np.asarray(polygon["vertices"], dtype=float))
             selected_mask |= polygon_mask
             cluster_counts = pd.Series(cluster_values[polygon_mask]).value_counts().sort_index()
-            polygon_summaries.append(
-                {
-                    "polygon_id": polygon["polygon_id"],
-                    "n_cells": int(polygon_mask.sum()),
-                    "clusters": [
-                        {"cluster": str(cluster), "n_cells": int(count)}
-                        for cluster, count in cluster_counts.items()
-                    ],
-                }
-            )
+            polygon_summaries.append({
+                "polygon_id": polygon["polygon_id"],
+                "n_cells": int(polygon_mask.sum()),
+                "clusters": [
+                    {"cluster": str(cluster), "n_cells": int(count)}
+                    for cluster, count in cluster_counts.items()
+                ],
+            })
 
         selected_indices = np.flatnonzero(selected_mask)
-        selected_cell_ids = (
-            _obs_to_str_array(adata.obs, "cell_id")[selected_indices]
-            if "cell_id" in adata.obs.columns
-            else adata.obs_names.to_numpy(dtype=object)[selected_indices]
-        )
         return {
             "total_selected_cells": int(selected_indices.size),
             "selected_indices": selected_indices.tolist(),
-            "selected_cell_ids": [str(cell_id) for cell_id in selected_cell_ids.tolist()],
+            "selected_cell_ids": [str(cid) for cid in cell_ids_arr[selected_indices].tolist()],
             "polygon_summaries": polygon_summaries,
         }
 
     def get_features(self, record: ObjectRecord, pca_key: str = "X_pca_lineage") -> np.ndarray:
-        adata = self.get_adata(record)
-        key = pca_key if pca_key in adata.obsm else next((k for k in adata.obsm if "pca" in k.lower()), None)
-        if key is None:
-            raise KeyError("No PCA embedding available in obsm.")
-        return np.asarray(adata.obsm[key], dtype=float)
+        with h5py.File(record.object_path, "r") as f:
+            if "obsm" not in f:
+                raise KeyError("No PCA embedding available in obsm.")
+            obsm_keys = list(f["obsm"].keys())
+            key = pca_key if pca_key in obsm_keys else next((k for k in obsm_keys if "pca" in k.lower()), None)
+            if key is None:
+                raise KeyError("No PCA embedding available in obsm.")
+            return _h5_obsm(f, key).astype(float)
 
     def get_graph(self, record: ObjectRecord) -> sparse.spmatrix | None:
-        adata = self.get_adata(record)
-        graph = adata.obsp.get("lineage_connectivities")
-        if graph is None:
-            return None
-        return graph.tocsr() if sparse.issparse(graph) else sparse.csr_matrix(graph)
+        with h5py.File(record.object_path, "r") as f:
+            if "obsp" not in f or "lineage_connectivities" not in f["obsp"]:
+                return None
+            return _h5_obsp_sparse(f, "lineage_connectivities")
+
+    def get_or_build_knn_graph(
+        self, record: ObjectRecord, n_neighbors: int, pca_key: str = "X_pca_lineage"
+    ) -> sparse.spmatrix:
+        """Return the object's neighbor graph, building it at most once per session.
+
+        Most lineage objects here have no precomputed `obsp/lineage_connectivities`,
+        so without caching every propagate() call pays for a fresh brute-force KNN
+        build over the full object (tens of seconds on the larger lineages). Since
+        annotation workflows typically re-run propagation several times while tuning
+        thresholds, caching the built graph in memory makes every call after the
+        first instant.
+        """
+        precomputed = self.get_graph(record)
+        if precomputed is not None:
+            return precomputed
+        cache_key = f"{record.object_id}:{n_neighbors}:{pca_key}"
+        cached = self._graph_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        graph = build_knn_graph(self.get_features(record, pca_key=pca_key), n_neighbors)
+        self._graph_cache[cache_key] = graph
+        return graph
+
+    def get_obs_for_propagation(
+        self, record: ObjectRecord, cluster_key: str
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+        """Read (n_obs, obs_names, cluster_values, cell_ids) via h5py — X matrix never loaded."""
+        with h5py.File(record.object_path, "r") as f:
+            n_obs = _h5_n_obs(f)
+            obs_names = _h5_obs_names(f)
+            obs_cols = _h5_obs_col_names(f)
+            cluster_values = (
+                _h5_obs_col(f, cluster_key, default="NA")
+                if cluster_key in obs_cols
+                else np.full(n_obs, "all", dtype=object)
+            )
+            cell_ids = _h5_obs_col(f, "cell_id") if "cell_id" in obs_cols else obs_names
+        return n_obs, obs_names, cluster_values, cell_ids
 
     def get_cluster_label_editor(self, record: ObjectRecord, cluster_key: str) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        if cluster_key not in adata.obs.columns:
-            raise ValueError(f"Cluster key not found in obs: {cluster_key}")
-
-        cluster_values = _obs_to_str_array(adata.obs, cluster_key, default="NA")
-        display_column = _display_column_name(cluster_key)
-        existing_display = (
-            _obs_to_str_array(adata.obs, display_column, default="")
-            if display_column in adata.obs.columns
-            else np.full(adata.n_obs, "", dtype=object)
-        )
+        with h5py.File(record.object_path, "r") as f:
+            if cluster_key not in f["obs"]:
+                raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+            cluster_values = _h5_obs_col(f, cluster_key, default="NA")
+            display_column = _display_column_name(cluster_key)
+            existing_display = (
+                _h5_obs_col(f, display_column, default="")
+                if display_column in f["obs"]
+                else np.full(len(cluster_values), "", dtype=object)
+            )
 
         rows: list[dict[str, Any]] = []
         counts = pd.Series(cluster_values).value_counts(sort=False)
@@ -1600,13 +2298,11 @@ class AnnDataService:
             mask = cluster_values == cluster_id
             display_values = pd.Series(existing_display[mask]).replace("", pd.NA).dropna()
             display_name = str(display_values.iloc[0]) if not display_values.empty else None
-            rows.append(
-                {
-                    "cluster_id": str(cluster_id),
-                    "n_cells": int(counts.loc[cluster_id]),
-                    "display_name": display_name,
-                }
-            )
+            rows.append({
+                "cluster_id": str(cluster_id),
+                "n_cells": int(counts.loc[cluster_id]),
+                "display_name": display_name,
+            })
 
         return {
             "object_id": record.object_id,
@@ -1623,25 +2319,30 @@ class AnnDataService:
         mapping: dict[str, str],
         display_column: str | None = None,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record).copy()
-        if cluster_key not in adata.obs.columns:
-            raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+        # Renaming clusters only touches one obs column + a couple of uns entries —
+        # loading the full object (including X) and rewriting the entire file to
+        # disk costs tens of seconds on the larger lineages for a change that's a
+        # few KB. Patch just the affected elements in place instead.
+        with h5py.File(record.object_path, "r") as f:
+            obs_cols = _h5_obs_col_names(f)
+            if cluster_key not in obs_cols:
+                raise ValueError(f"Cluster key not found in obs: {cluster_key}")
+            cluster_values = _h5_obs_col(f, cluster_key, default="NA")
+            existing_definitions = (
+                dict(read_elem(f["uns"]["cluster_display_name_definitions"]))
+                if "cluster_display_name_definitions" in f["uns"]
+                else {}
+            )
 
         display_column = display_column or _display_column_name(cluster_key)
-        cluster_values = _obs_to_str_array(adata.obs, cluster_key, default="NA")
         normalized_mapping = {str(key): value.strip() for key, value in mapping.items() if value.strip()}
         display_values = np.asarray(
             [normalized_mapping.get(str(cluster_id), str(cluster_id)) for cluster_id in cluster_values],
             dtype=object,
         )
-        adata.obs[display_column] = pd.Series(display_values, index=adata.obs_names, dtype=object)
 
-        display_name_definitions = deepcopy(adata.uns.get("cluster_display_name_definitions", {}))
+        display_name_definitions = deepcopy(existing_definitions)
         display_name_definitions[str(cluster_key)] = normalized_mapping
-        adata.uns["cluster_display_name_definitions"] = display_name_definitions
-
-        if cluster_key == "reannot_label":
-            adata.uns["reannotation_label_definitions"] = normalized_mapping
 
         self._record_latest_object_change_snapshot(
             records=[record],
@@ -1649,7 +2350,24 @@ class AnnDataService:
             description=f"Save cluster names on {record.lineage_name} for {cluster_key}.",
         )
         try:
-            self._write_object(record, adata, prefix=f"{record.object_path.stem}_display_labels_")
+            ad.settings.allow_write_nullable_strings = True
+            with h5py.File(record.object_path, "r+") as f:
+                if display_column in f["obs"]:
+                    del f["obs"][display_column]
+                write_elem(f["obs"], display_column, pd.array(display_values, dtype="string"))
+                column_order = [str(c) for c in f["obs"].attrs.get("column-order", [])]
+                if display_column not in column_order:
+                    f["obs"].attrs["column-order"] = np.array(column_order + [display_column], dtype=object)
+
+                if "cluster_display_name_definitions" in f["uns"]:
+                    del f["uns"]["cluster_display_name_definitions"]
+                write_elem(f["uns"], "cluster_display_name_definitions", display_name_definitions)
+
+                if cluster_key == "reannot_label":
+                    if "reannotation_label_definitions" in f["uns"]:
+                        del f["uns"]["reannotation_label_definitions"]
+                    write_elem(f["uns"], "reannotation_label_definitions", normalized_mapping)
+            self.invalidate_cached(record.object_id)
         except Exception:
             self._clear_latest_object_change_snapshot()
             raise
@@ -1660,6 +2378,142 @@ class AnnDataService:
             "display_column": display_column,
             "n_updated": int(len(normalized_mapping)),
         }
+
+    def save_propagation_results(self, record: ObjectRecord, session: SessionState) -> dict[str, Any]:
+        """Write a completed propagation's per-cell labels into the object in place.
+
+        Only touches obs columns + a handful of uns bookkeeping keys — X/obsm are
+        never loaded, so this is a small, fast write regardless of object size
+        (previously this loaded and rewrote the entire AnnData object, including
+        the gene matrix, costing tens of seconds on the larger lineages)."""
+        if session.last_propagation is None:
+            raise ValueError("No propagated result is available to save.")
+        result = session.last_propagation
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with h5py.File(record.object_path, "r") as f:
+            n_obs = _h5_n_obs(f)
+            obs_cols = _h5_obs_col_names(f)
+            cluster_values = (
+                _h5_obs_col(f, result.cluster_key, default="NA")
+                if result.cluster_key in obs_cols
+                else np.full(n_obs, "all", dtype=object)
+            )
+            existing_history_raw = (
+                read_elem(f["uns"]["reannotation_sessions"]) if "reannotation_sessions" in f["uns"] else {}
+            )
+
+        seed_mask = np.zeros(n_obs, dtype=bool)
+        polygon_ids = np.full(n_obs, "", dtype=object)
+        for index in session.seed_labels:
+            seed_mask[index] = True
+            polygon_ids[index] = ";".join(sorted(session.seed_polygon_ids.get(index, set())))
+
+        label_definitions = dict(session.seed_display_names)
+        display_labels = np.asarray(
+            [label_definitions.get(str(label), str(label)) for label in result.assigned_labels],
+            dtype=object,
+        )
+
+        save_manifest = {
+            "session_id": session.session_id,
+            "source_object": str(record.object_path),
+            "saved_object": str(record.object_path),
+            "embedding_key": session.embedding_key,
+            "cluster_key": session.cluster_key,
+            "method": result.method,
+            "scope": result.scope,
+            "annotate_all": result.annotate_all,
+            "graph_smoothing": result.graph_smoothing,
+            "n_seed_cells": int(seed_mask.sum()),
+            "n_assigned_cells": int(result.assigned_mask.sum()),
+            "timestamp": timestamp,
+        }
+        if isinstance(existing_history_raw, list):
+            sessions_history = {
+                str(index): value for index, value in enumerate(existing_history_raw) if isinstance(value, dict)
+            }
+        elif isinstance(existing_history_raw, dict):
+            sessions_history = dict(existing_history_raw)
+        else:
+            # Legacy/unexpected uns encodings (e.g. a raw string-array) — discard rather than crash.
+            sessions_history = {}
+        sessions_history[timestamp] = save_manifest
+        sessions_history_safe = _json_safe(sessions_history)
+        save_manifest_safe = _json_safe(save_manifest)
+        label_definitions_safe = _json_safe(label_definitions)
+
+        obs_updates: dict[str, np.ndarray] = {
+            "reannot_label": result.assigned_labels,
+            "reannot_display_label": display_labels,
+            "reannot_label_source": np.where(
+                seed_mask, "polygon_seed", np.where(result.assigned_mask, result.method, "unassigned")
+            ),
+            "reannot_confidence": np.asarray(result.assigned_scores, dtype=float),
+            "reannot_margin": np.asarray(result.assigned_margins, dtype=float),
+            "reannot_seed": seed_mask,
+            "reannot_polygon_ids": polygon_ids,
+            "reannot_scope": np.repeat(result.scope, n_obs),
+            "reannot_cluster_key": np.repeat(result.cluster_key, n_obs),
+            "reannot_session_id": np.repeat(session.session_id, n_obs),
+            "reannot_timestamp": np.repeat(timestamp, n_obs),
+        }
+        uns_updates = {
+            "reannotation_sessions": sessions_history_safe,
+            "reannotation_sessions_json": json.dumps(sessions_history_safe, indent=2),
+            "reannotation_last_session": save_manifest_safe,
+            "reannotation_label_definitions": label_definitions_safe,
+            "reannotation_save_manifest": save_manifest_safe,
+        }
+
+        self._record_latest_object_change_snapshot(
+            records=[record],
+            change_type="save_reannotated_object",
+            description=f"Save propagated reannotation fields on {record.lineage_name}.",
+        )
+        try:
+            ad.settings.allow_write_nullable_strings = True
+            with h5py.File(record.object_path, "r+") as f:
+                for column, values in obs_updates.items():
+                    _h5_write_obs_column(f, column, np.asarray(values))
+                for key, value in uns_updates.items():
+                    if key in f["uns"]:
+                        del f["uns"][key]
+                    write_elem(f["uns"], key, value)
+            self.invalidate_cached(record.object_id)
+        except Exception:
+            self._clear_latest_object_change_snapshot()
+            raise
+
+        cluster_frame = pd.DataFrame(
+            {
+                "cluster": cluster_values,
+                "predicted_label": result.assigned_labels,
+                "assigned": result.assigned_mask,
+                "score": result.assigned_scores,
+            }
+        )
+        cluster_summary = []
+        for cluster, group in cluster_frame.groupby("cluster", sort=True):
+            if bool(group["assigned"].any()):
+                label_counts = group.loc[group["assigned"], "predicted_label"].value_counts(normalize=True)
+                predicted_label = str(label_counts.index[0])
+                purity = float(label_counts.iloc[0])
+            else:
+                predicted_label = "Unassigned"
+                purity = 0.0
+            cluster_summary.append(
+                {
+                    "cluster": str(cluster),
+                    "predicted_label": predicted_label,
+                    "n_cells": int(group.shape[0]),
+                    "n_assigned": int(group["assigned"].sum()),
+                    "purity": purity,
+                    "mean_score": float(group["score"].mean()),
+                }
+            )
+
+        return {"object_path": record.object_path, "cluster_summary": cluster_summary}
 
     def promote_reannot_new_to_canonical(self, record: ObjectRecord) -> dict[str, Any]:
         adata = self.get_adata(record).copy()
@@ -1732,42 +2586,51 @@ class AnnDataService:
     }
 
     def get_obs_columns(self, record: ObjectRecord) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        columns = []
-        for col in adata.obs.columns:
-            series = adata.obs[col]
-            is_numeric = pd.api.types.is_numeric_dtype(series)
-            if is_numeric:
-                dtype = "float" if pd.api.types.is_float_dtype(series) else "int"
-                n_unique = None
-            else:
-                dtype = "categorical"
-                non_null = series.dropna()
-                n_unique = int(non_null.astype("string").nunique()) if not non_null.empty else 0
-            columns.append({
-                "name": col,
-                "dtype": dtype,
-                "is_numeric": is_numeric,
-                "is_qc": col in self._QC_COLUMNS,
-                "n_unique": n_unique,
-            })
+        with h5py.File(record.object_path, "r") as f:
+            obs_cols = _h5_obs_col_names(f)
+            obs_grp = f["obs"]
+            columns = []
+            for col in obs_cols:
+                if col not in obs_grp:
+                    continue
+                item = obs_grp[col]
+                if isinstance(item, h5py.Group):
+                    n_cats = _h5_category_count(item) if "categories" in item else 0
+                    columns.append({
+                        "name": col,
+                        "dtype": "categorical",
+                        "is_numeric": False,
+                        "is_qc": col in self._QC_COLUMNS,
+                        "n_unique": n_cats,
+                    })
+                else:
+                    is_numeric = item.dtype.kind in ("f", "i", "u", "b")
+                    dtype = "float" if item.dtype.kind == "f" else ("int" if is_numeric else "categorical")
+                    columns.append({
+                        "name": col,
+                        "dtype": dtype,
+                        "is_numeric": is_numeric,
+                        "is_qc": col in self._QC_COLUMNS,
+                        "n_unique": None,
+                    })
         return {"object_id": record.object_id, "columns": columns}
 
     def get_obs_values(self, record: ObjectRecord, column: str, indices: list[int]) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        if column not in adata.obs.columns:
-            raise ValueError(f"Column '{column}' not found in obs.")
-        series = adata.obs[column]
-        is_numeric = pd.api.types.is_numeric_dtype(series)
-        dtype = "float" if is_numeric and pd.api.types.is_float_dtype(series) else ("int" if is_numeric else "categorical")
+        with h5py.File(record.object_path, "r") as f:
+            if column not in f["obs"]:
+                raise ValueError(f"Column '{column}' not found in obs.")
+            is_numeric = _h5_obs_col_is_numeric(f, column)
+            dtype = "float" if (is_numeric and f["obs"][column].dtype.kind == "f") else ("int" if is_numeric else "categorical")
+            col_data = _h5_obs_col(f, column)
         idx_arr = np.asarray(indices, dtype=int)
         values = []
-        for i, obs_idx in enumerate(idx_arr.tolist()):
-            raw = series.iloc[obs_idx]
+        for obs_idx in idx_arr.tolist():
+            raw = col_data[obs_idx]
             if is_numeric:
-                v: float | str | None = None if pd.isna(raw) else float(raw)
+                v: float | str | None = None if (isinstance(raw, float) and np.isnan(raw)) else float(raw)
             else:
-                v = None if pd.isna(raw) else str(raw)
+                raw_str = str(raw) if raw is not None else ""
+                v = None if raw_str == "" else raw_str
             values.append({"index": int(obs_idx), "value": v})
         return {"object_id": record.object_id, "column": column, "dtype": dtype, "is_numeric": is_numeric, "values": values}
 
@@ -1961,7 +2824,30 @@ class AnnDataService:
 
     def get_annotation_coverage(self, record: ObjectRecord) -> dict[str, Any]:
         try:
-            adata = self.get_adata(record)
+            with h5py.File(record.object_path, "r") as f:
+                obs_cols = _h5_obs_col_names(f)
+                n_obs = _h5_n_obs(f)
+                obs_grp = f["obs"]
+                annotation_col = next(
+                    (col for col in ("reannot_label", "reannot_display_label") if col in obs_grp),
+                    None,
+                )
+                if annotation_col:
+                    labels = _h5_obs_col(f, annotation_col, default="")
+                    annotated = int((labels != "").sum())
+                    frac = float(annotated / n_obs) if n_obs > 0 else 0.0
+                else:
+                    annotated = None
+                    frac = None
+                cluster_keys = _h5_cluster_key_candidates(f, obs_cols)
+                default_cluster = cluster_keys[0] if cluster_keys else None
+                n_clusters = None
+                if default_cluster and default_cluster in obs_grp:
+                    item = obs_grp[default_cluster]
+                    if isinstance(item, h5py.Group) and "categories" in item:
+                        n_clusters = _h5_category_count(item)
+                    elif isinstance(item, h5py.Dataset):
+                        n_clusters = int(len(np.unique(item[:])))
         except Exception:
             return {
                 "object_id": record.object_id,
@@ -1972,29 +2858,10 @@ class AnnDataService:
                 "annotation_column": None,
                 "n_clusters": None,
             }
-        annotation_col = next(
-            (col for col in ("reannot_label", "reannot_display_label") if col in adata.obs.columns),
-            None,
-        )
-        if annotation_col:
-            labels = _obs_to_str_array(adata.obs, annotation_col)
-            annotated = int((labels != "").sum())
-            frac = float(annotated / adata.n_obs) if adata.n_obs > 0 else 0.0
-        else:
-            annotated = None
-            frac = None
-
-        cluster_keys = _cluster_key_candidates(adata.obs)
-        default_cluster = cluster_keys[0] if cluster_keys else None
-        n_clusters = None
-        if default_cluster:
-            vals = _obs_to_str_array(adata.obs, default_cluster)
-            n_clusters = int(np.unique(vals).size)
-
         return {
             "object_id": record.object_id,
             "lineage_name": record.lineage_name,
-            "n_cells": int(adata.n_obs),
+            "n_cells": int(n_obs),
             "n_annotated": annotated,
             "annotation_fraction": frac,
             "annotation_column": annotation_col,
@@ -2009,15 +2876,15 @@ class AnnDataService:
         key_a: str,
         key_b: str,
     ) -> dict[str, Any]:
-        adata = self.get_adata(record)
-        for key in (key_a, key_b):
-            if key not in adata.obs.columns:
-                raise ValueError(f"Column '{key}' not found in obs.")
-        labels_a = _obs_to_str_array(adata.obs, key_a)
-        labels_b = _obs_to_str_array(adata.obs, key_b)
+        with h5py.File(record.object_path, "r") as f:
+            for key in (key_a, key_b):
+                if key not in f["obs"]:
+                    raise ValueError(f"Column '{key}' not found in obs.")
+            labels_a = _h5_obs_col(f, key_a, default="").astype(str)
+            labels_b = _h5_obs_col(f, key_b, default="").astype(str)
+            n_obs = len(labels_a)
         changed = labels_a != labels_b
         changed_indices = np.flatnonzero(changed).tolist()
-
         pairs = pd.DataFrame({"a": labels_a, "b": labels_b})
         transition_counts = pairs.groupby(["a", "b"]).size().reset_index(name="count")
         transitions = [
@@ -2028,7 +2895,7 @@ class AnnDataService:
             "object_id": record.object_id,
             "key_a": key_a,
             "key_b": key_b,
-            "total_cells": int(adata.n_obs),
+            "total_cells": int(n_obs),
             "changed_cells": int(changed.sum()),
             "unchanged_cells": int((~changed).sum()),
             "transitions": transitions,

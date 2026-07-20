@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from pathlib import Path
 
 import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
@@ -64,7 +62,6 @@ from app.schemas.api import (
 )
 from app.services.adata_service import adata_service
 from app.services.propagation import (
-    build_knn_graph,
     neighborhood_mask,
     run_graph_diffusion,
     run_knn_vote,
@@ -73,20 +70,6 @@ from app.services.registry import registry
 from app.services.sessions import session_store
 
 router = APIRouter()
-
-
-def _json_safe(value):
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return [_json_safe(item) for item in value.tolist()]
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    return value
 
 
 def _object_card(record) -> ObjectCard:
@@ -121,10 +104,6 @@ def _global_record():
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def _string_series(values, index) -> pd.Series:
-    return pd.Series(np.asarray(values, dtype=object), index=index, dtype=object)
-
-
 def _validate_saved_h5ad(path: Path) -> None:
     required_keys = {"X", "obs", "var", "obsm", "uns"}
     try:
@@ -143,14 +122,31 @@ def _validate_saved_h5ad(path: Path) -> None:
         ) from exc
 
 
+@router.get("/capabilities")
+def capabilities():
+    """Return feature flags based on what data is available on disk."""
+    return {"has_global": settings.default_global_object_path.exists()}
+
+
 @router.post("/scan-folder", response_model=list[ObjectCard])
 def scan_folder(request: ScanFolderRequest) -> list[ObjectCard]:
     fallback_folder = settings.default_lineage_root
-    requested_folder = Path(request.folder_path).expanduser() if request.folder_path else None
-    if requested_folder and not requested_folder.exists() and str(requested_folder) == "/data/lineages_current":
+    requested_path = Path(request.folder_path).expanduser() if request.folder_path else None
+
+    # If the user passed a direct path to a single .h5ad file, register just that file.
+    if requested_path and requested_path.suffix == ".h5ad":
+        try:
+            records = registry.register_single(requested_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        for record in records:
+            adata_service.invalidate_cached(record.object_id)
+        return [_object_card(record) for record in records]
+
+    if requested_path and not requested_path.exists() and str(requested_path) == "/data/lineages_current":
         folder = fallback_folder
     else:
-        folder = requested_folder or fallback_folder
+        folder = requested_path or fallback_folder
     try:
         records = registry.scan(folder)
     except FileNotFoundError as exc:
@@ -190,7 +186,7 @@ def global_metadata() -> MetadataResponse:
 
 
 @router.post("/global/umap", response_model=UmapResponse)
-def global_umap(request: UmapRequest) -> UmapResponse:
+def global_umap(request: UmapRequest, background_tasks: BackgroundTasks) -> UmapResponse:
     record = _global_record()
     try:
         payload = adata_service.get_umap_points(
@@ -205,6 +201,30 @@ def global_umap(request: UmapRequest) -> UmapResponse:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.get("view_token"):
+        background_tasks.add_task(adata_service.prewarm_view_submatrix, record, payload["view_token"])
+    return UmapResponse(**payload)
+
+
+@router.post("/global/umap-combined", response_model=UmapResponse)
+def global_umap_combined(request: UmapRequest, background_tasks: BackgroundTasks) -> UmapResponse:
+    record = _global_record()
+    lineage_records = registry.list_records()
+    try:
+        payload = adata_service.get_combined_global_umap_points(
+            global_record=record,
+            lineage_records=lineage_records,
+            embedding_key=request.embedding_key,
+            cluster_key=request.cluster_key,
+            max_points=request.max_points,
+            min_per_cluster=request.min_per_cluster,
+            max_per_cluster=request.max_per_cluster,
+            random_seed=request.random_seed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.get("view_token"):
+        background_tasks.add_task(adata_service.prewarm_view_submatrix, record, payload["view_token"])
     return UmapResponse(**payload)
 
 
@@ -257,7 +277,9 @@ def global_highlight_visible_from_object(request: VisibleHighlightRequest) -> Vi
 def object_gene_expression(object_id: str, request: GeneExpressionRequest) -> GeneExpressionResponse:
     record = _resolve_record(object_id)
     try:
-        payload = adata_service.get_gene_expression_values(record, request.gene_name, request.indices)
+        payload = adata_service.get_gene_expression_values(
+            record, request.gene_name, request.indices, view_token=request.view_token
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return GeneExpressionResponse(**payload)
@@ -273,7 +295,9 @@ def global_genes() -> GeneCatalogResponse:
 def global_gene_expression(request: GeneExpressionRequest) -> GeneExpressionResponse:
     record = _global_record()
     try:
-        payload = adata_service.get_gene_expression_values(record, request.gene_name, request.indices)
+        payload = adata_service.get_gene_expression_values(
+            record, request.gene_name, request.indices, view_token=request.view_token
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return GeneExpressionResponse(**payload)
@@ -347,7 +371,7 @@ def embedding_keys(object_id: str) -> list[str]:
 
 
 @router.post("/objects/{object_id}/umap", response_model=UmapResponse)
-def umap_points(object_id: str, request: UmapRequest) -> UmapResponse:
+def umap_points(object_id: str, request: UmapRequest, background_tasks: BackgroundTasks) -> UmapResponse:
     record = _resolve_record(object_id)
     try:
         payload = adata_service.get_umap_points(
@@ -362,6 +386,8 @@ def umap_points(object_id: str, request: UmapRequest) -> UmapResponse:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.get("view_token"):
+        background_tasks.add_task(adata_service.prewarm_view_submatrix, record, payload["view_token"])
     return UmapResponse(**payload)
 
 
@@ -503,20 +529,15 @@ def propagate(object_id: str, request: PropagateRequest) -> PropagateResponse:
         cluster_key=request.cluster_key,
     )
 
-    adata = adata_service.get_adata(record)
-    n_obs = adata.n_obs
+    n_obs, obs_names, cluster_values, cell_ids = adata_service.get_obs_for_propagation(
+        record, request.cluster_key
+    )
     seed_labels = np.full(n_obs, "", dtype=object)
     for index, label in session.seed_labels.items():
         seed_labels[index] = label
     seed_mask = seed_labels != ""
     if not seed_mask.any():
         raise HTTPException(status_code=400, detail="No seed cells available in the session.")
-
-    cluster_values = (
-        adata.obs[request.cluster_key].astype("string").fillna("NA").to_numpy(dtype=object)
-        if request.cluster_key in adata.obs.columns
-        else np.full(n_obs, "all", dtype=object)
-    )
     graph = adata_service.get_graph(record)
     eligible_mask = _eligible_mask(
         request.scope,
@@ -526,8 +547,11 @@ def propagate(object_id: str, request: PropagateRequest) -> PropagateResponse:
         neighborhood_hops=request.neighborhood_hops,
     )
 
-    if graph is None:
-        graph = build_knn_graph(adata_service.get_features(record), request.n_neighbors)
+    # Only graph_diffusion consumes `graph` below — knn_vote fits its own (much
+    # smaller) neighbor index over just the seed cells. Skip the expensive
+    # whole-object graph build entirely when it won't be used.
+    if graph is None and request.method == "graph_diffusion":
+        graph = adata_service.get_or_build_knn_graph(record, request.n_neighbors)
     features = adata_service.get_features(record)
 
     if request.method == "graph_diffusion":
@@ -580,12 +604,11 @@ def propagate(object_id: str, request: PropagateRequest) -> PropagateResponse:
     )
     cells = []
     for idx in np.flatnonzero(result.eligible_mask):
-        cell_id = str(adata.obs.iloc[idx]["cell_id"]) if "cell_id" in adata.obs.columns else str(adata.obs_names[idx])
         cells.append(
             {
                 "index": int(idx),
-                "obs_name": str(adata.obs_names[idx]),
-                "cell_id": cell_id,
+                "obs_name": str(obs_names[idx]),
+                "cell_id": str(cell_ids[idx]),
                 "predicted_label": str(result.assigned_labels[idx]),
                 "score": float(result.scores[idx]),
                 "margin": float(result.margins[idx]),
@@ -658,128 +681,19 @@ def save_session(object_id: str, request: SaveRequest) -> SaveResponse:
         session = session_store.get(request.session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if session.last_propagation is None:
-        raise HTTPException(status_code=400, detail="No propagated result is available to save.")
-
-    adata = adata_service.get_adata(record).copy()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = record.object_path
-
-    n_obs = adata.n_obs
-    seed_mask = np.zeros(n_obs, dtype=bool)
-    seed_label_values = np.full(n_obs, "", dtype=object)
-    polygon_ids = np.full(n_obs, "", dtype=object)
-    for index, label in session.seed_labels.items():
-        seed_mask[index] = True
-        seed_label_values[index] = label
-        polygon_ids[index] = ";".join(sorted(session.seed_polygon_ids.get(index, set())))
-
-    result = session.last_propagation
-    label_definitions = dict(session.seed_display_names)
-    display_labels = np.asarray(
-        [label_definitions.get(str(label), str(label)) for label in result.assigned_labels],
-        dtype=object,
-    )
-    adata.obs["reannot_label"] = _string_series(result.assigned_labels, adata.obs_names)
-    adata.obs["reannot_display_label"] = _string_series(display_labels, adata.obs_names)
-    adata.obs["reannot_label_source"] = _string_series(
-        np.where(seed_mask, "polygon_seed", np.where(result.assigned_mask, result.method, "unassigned")),
-        adata.obs_names,
-    )
-    adata.obs["reannot_confidence"] = pd.Series(result.assigned_scores, index=adata.obs_names, dtype=float)
-    adata.obs["reannot_margin"] = pd.Series(result.assigned_margins, index=adata.obs_names, dtype=float)
-    adata.obs["reannot_seed"] = pd.Series(seed_mask, index=adata.obs_names, dtype=bool)
-    adata.obs["reannot_polygon_ids"] = _string_series(polygon_ids, adata.obs_names)
-    adata.obs["reannot_scope"] = _string_series(np.repeat(result.scope, n_obs), adata.obs_names)
-    adata.obs["reannot_cluster_key"] = _string_series(np.repeat(result.cluster_key, n_obs), adata.obs_names)
-    adata.obs["reannot_session_id"] = _string_series(np.repeat(session.session_id, n_obs), adata.obs_names)
-    adata.obs["reannot_timestamp"] = _string_series(np.repeat(timestamp, n_obs), adata.obs_names)
-
-    save_manifest = {
-        "session_id": session.session_id,
-        "source_object": str(record.object_path),
-        "saved_object": str(output_path),
-        "embedding_key": session.embedding_key,
-        "cluster_key": session.cluster_key,
-        "method": result.method,
-        "scope": result.scope,
-        "annotate_all": result.annotate_all,
-        "graph_smoothing": result.graph_smoothing,
-        "n_seed_cells": int(seed_mask.sum()),
-        "n_assigned_cells": int(result.assigned_mask.sum()),
-        "timestamp": timestamp,
-    }
-    existing_history = adata.uns.get("reannotation_sessions", {})
-    if isinstance(existing_history, list):
-        sessions_history = {
-            str(index): value
-            for index, value in enumerate(existing_history)
-            if isinstance(value, dict)
-        }
-    elif isinstance(existing_history, dict):
-        sessions_history = dict(existing_history)
-    else:
-        sessions_history = {}
-    sessions_history[timestamp] = save_manifest
-    sessions_history_safe = _json_safe(sessions_history)
-    save_manifest_safe = _json_safe(save_manifest)
-    label_definitions_safe = _json_safe(label_definitions)
-    adata.uns["reannotation_sessions"] = sessions_history_safe
-    adata.uns["reannotation_sessions_json"] = json.dumps(sessions_history_safe, indent=2)
-    adata.uns["reannotation_last_session"] = save_manifest_safe
-    adata.uns["reannotation_label_definitions"] = label_definitions_safe
-    adata.uns["reannotation_save_manifest"] = save_manifest_safe
-
-    adata_service._record_latest_object_change_snapshot(
-        records=[record],
-        change_type="save_reannotated_object",
-        description=f"Save propagated reannotation fields on {record.lineage_name}.",
-    )
     try:
-        adata_service._write_object(record, adata, prefix=f"{record.object_path.stem}_save_")
-    except Exception:
-        adata_service._clear_latest_object_change_snapshot()
-        raise
-    cluster_series = (
-        adata.obs[result.cluster_key].astype("string").fillna("NA")
-        if result.cluster_key in adata.obs.columns
-        else pd.Series("all", index=adata.obs_names, dtype="string")
-    )
-    frame = pd.DataFrame(
-        {
-            "cluster": cluster_series.to_numpy(dtype=object),
-            "predicted_label": result.assigned_labels,
-            "assigned": result.assigned_mask,
-            "score": result.assigned_scores,
-        }
-    )
-    cluster_summary = []
-    for cluster, group in frame.groupby("cluster", sort=True):
-        if bool(group["assigned"].any()):
-            label_counts = group.loc[group["assigned"], "predicted_label"].value_counts(normalize=True)
-            predicted_label = str(label_counts.index[0])
-            purity = float(label_counts.iloc[0])
-        else:
-            predicted_label = "Unassigned"
-            purity = 0.0
-        cluster_summary.append(
-            {
-                "cluster": str(cluster),
-                "predicted_label": predicted_label,
-                "n_cells": int(group.shape[0]),
-                "n_assigned": int(group["assigned"].sum()),
-                "purity": purity,
-                "mean_score": float(group["score"].mean()),
-            }
-        )
+        result = adata_service.save_propagation_results(record, session)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     session_json_path, polygons_geojson_path, summary_csv_path = session_store.save_sidecars(
         session_id=session.session_id,
         base_path=record.object_path.with_suffix(""),
-        cluster_summary=cluster_summary,
+        cluster_summary=result["cluster_summary"],
     )
 
     return SaveResponse(
-        object_path=str(record.object_path),
+        object_path=str(result["object_path"]),
         session_json_path=str(session_json_path),
         polygons_geojson_path=str(polygons_geojson_path),
         summary_csv_path=str(summary_csv_path),

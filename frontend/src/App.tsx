@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent } from 'react'
+import React, { useEffect, useRef, useState, type MouseEvent } from 'react'
 import AnnotationDiffPanel from './components/AnnotationDiffPanel'
 import ClusterLabelEditor from './components/ClusterLabelEditor'
 import DEPanel from './components/DEPanel'
@@ -7,11 +7,15 @@ import LiveSessionBanner from './components/LiveSessionBanner'
 import MarkerDotplotPanel from './components/MarkerDotplotPanel'
 import ObjectBrowser from './components/ObjectBrowser'
 import ObsMetadataPanel from './components/ObsMetadataPanel'
+import ProgressOverlay from './components/ProgressOverlay'
 import ProjectDashboard from './components/ProjectDashboard'
 import SessionSidebar from './components/SessionSidebar'
 import SpatialCanvas from './components/SpatialCanvas'
 import UmapCanvas from './components/UmapCanvas'
 import { useStore } from './app/store'
+
+const MIN_COL = 180
+const MAX_COL = 700
 
 export default function App() {
   const mainStageRef = useRef<HTMLElement | null>(null)
@@ -19,11 +23,46 @@ export default function App() {
     thumbHeight: 0,
     thumbTop: 0
   })
+
+  const [leftW, setLeftW] = useState(360)
+  const [rightW, setRightW] = useState(360)
+  const dragRef = useRef<{ side: 'left' | 'right'; startX: number; startW: number } | null>(null)
+
+  const startDrag = (side: 'left' | 'right') => (e: React.MouseEvent) => {
+    e.preventDefault()
+    dragRef.current = { side, startX: e.clientX, startW: side === 'left' ? leftW : rightW }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
+
+  useEffect(() => {
+    const onMove = (e: globalThis.MouseEvent) => {
+      const drag = dragRef.current
+      if (!drag) return
+      const delta = e.clientX - drag.startX
+      const newW = Math.max(MIN_COL, Math.min(MAX_COL, drag.side === 'left' ? drag.startW + delta : drag.startW - delta))
+      if (drag.side === 'left') setLeftW(newW)
+      else setRightW(newW)
+    }
+    const onUp = () => {
+      if (!dragRef.current) return
+      dragRef.current = null
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [])
   const {
     scanFolder,
-    loadGlobalMetadata,
+    loadCapabilities,
     metadata,
     globalMetadata,
+    hasGlobal,
     busy,
     busyMessage,
     error,
@@ -38,9 +77,10 @@ export default function App() {
     selectedObjectId
   } = useStore((state) => ({
     scanFolder: state.scanFolder,
-    loadGlobalMetadata: state.loadGlobalMetadata,
+    loadCapabilities: state.loadCapabilities,
     metadata: state.metadata,
     globalMetadata: state.globalMetadata,
+    hasGlobal: state.hasGlobal,
     busy: state.busy,
     busyMessage: state.busyMessage,
     error: state.error,
@@ -60,8 +100,8 @@ export default function App() {
 
   useEffect(() => {
     void scanFolder()
-    void loadGlobalMetadata()
-  }, [loadGlobalMetadata, scanFolder])
+    void loadCapabilities()
+  }, [loadCapabilities, scanFolder])
 
   useEffect(() => {
     const element = mainStageRef.current
@@ -119,11 +159,12 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" style={{ gridTemplateColumns: `${leftW}px 18px minmax(0,1fr) 18px ${rightW}px` }}>
       <aside className="left-rail">
         <ObjectBrowser />
         <SessionSidebar />
       </aside>
+      <div className="resize-handle" onMouseDown={startDrag('left')} />
       <div className="main-stage-shell">
         <section className="main-stage" ref={mainStageRef}>
           <header className="stage-header">
@@ -175,24 +216,26 @@ export default function App() {
             >
               Lineage View
             </button>
-            <button
-              className={`tab-button ${activeViewMode === 'global' ? 'is-active' : ''}`}
-              onClick={() => setActiveViewMode('global')}
-            >
-              Global View
-            </button>
+            {hasGlobal ? (
+              <button
+                className={`tab-button ${activeViewMode === 'global' ? 'is-active' : ''}`}
+                onClick={() => setActiveViewMode('global')}
+              >
+                Global View
+              </button>
+            ) : null}
           </div>
 
           <UmapCanvas mode={activeViewMode} />
 
-          {/* F-06: Spatial view — only shown for lineage objects with spatial coords */}
-          {activeViewMode === 'lineage' && hasSpatial ? <SpatialCanvas /> : null}
+          {/* F-06: Spatial view — temporarily disabled */}
+          {/* {activeViewMode === 'lineage' && hasSpatial ? <SpatialCanvas /> : null} */}
 
           <ClusterLabelEditor />
           <MarkerDotplotPanel />
 
-          {/* F-04/F-13: Obs metadata coloring */}
-          {activeViewMode === 'lineage' ? <ObsMetadataPanel /> : null}
+          {/* F-04/F-13: Obs metadata coloring — temporarily disabled */}
+          {/* {activeViewMode === 'lineage' ? <ObsMetadataPanel /> : null} */}
 
           {/* F-08: Differential expression */}
           {activeViewMode === 'lineage' ? <DEPanel /> : null}
@@ -210,9 +253,11 @@ export default function App() {
           />
         </div>
       </div>
+      <div className="resize-handle" onMouseDown={startDrag('right')} />
       <GenePanel />
       {/* F-10: Project dashboard modal */}
       <ProjectDashboard />
+      <ProgressOverlay />
     </main>
   )
 }

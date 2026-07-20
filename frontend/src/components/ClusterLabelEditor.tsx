@@ -14,6 +14,7 @@ export default function ClusterLabelEditor() {
     moveClusterResult: store.moveClusterResult,
     objectUndoStatus: store.objectUndoStatus,
     objectUndoResult: store.objectUndoResult,
+    hasGlobal: store.hasGlobal,
     globalMetadata: store.globalMetadata,
     clusterVisibility: store.clusterVisibility,
     setClusterVisibility: store.setClusterVisibility,
@@ -77,15 +78,15 @@ export default function ClusterLabelEditor() {
           </button>
         </div>
       </div>
-      <div className="cluster-label-grid cluster-label-grid-actions">
+      <div className={`cluster-label-grid${state.hasGlobal ? ' cluster-label-grid-with-global' : ''}`}>
         <div className="cluster-label-grid-head">Show</div>
         <div className="cluster-label-grid-head">Cluster ID</div>
         <div className="cluster-label-grid-head">Cells</div>
-        <div className="cluster-label-grid-head">Human-readable name</div>
-        <div className="cluster-label-grid-head">Global</div>
+        <div className="cluster-label-grid-head">Label</div>
+        {state.hasGlobal && <div className="cluster-label-grid-head">Global</div>}
         <div className="cluster-label-grid-head">Move</div>
         {state.clusterLabelEditor.rows.map((row) => (
-          <div className="cluster-label-row cluster-label-row-actions" key={row.cluster_id}>
+          <div className="cluster-label-row" key={row.cluster_id}>
             <label className="cluster-visibility-cell">
               <input
                 type="checkbox"
@@ -93,13 +94,14 @@ export default function ClusterLabelEditor() {
                 onChange={(event) => state.setClusterVisibility(row.cluster_id, event.target.checked)}
               />
             </label>
-            <div className="mono">{row.cluster_id}</div>
-            <div>{row.n_cells.toLocaleString()}</div>
+            <div className="mono cluster-id-cell">{row.cluster_id}</div>
+            <div className="cluster-cells-cell">{row.n_cells.toLocaleString()}</div>
             <input
               value={row.display_name ?? ''}
               onChange={(event) => state.updateClusterLabelName(row.cluster_id, event.target.value)}
-              placeholder={`Name for ${row.cluster_id}`}
+              placeholder={`Label for ${row.cluster_id}`}
             />
+            {state.hasGlobal && (
               <button
                 className="button button-secondary button-inline"
                 onClick={() => void state.highlightClusterInGlobal(row.cluster_id, row.display_name ?? row.cluster_id)}
@@ -107,6 +109,7 @@ export default function ClusterLabelEditor() {
               >
                 Highlight
               </button>
+            )}
             <button
               className="button button-secondary button-inline"
               onClick={() => {

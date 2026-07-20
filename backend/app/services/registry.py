@@ -4,7 +4,6 @@ import hashlib
 import json
 from pathlib import Path
 
-import anndata as ad
 import h5py
 import pandas as pd
 
@@ -17,44 +16,45 @@ def _normalize_lineage_name(name: str) -> str:
 
 
 def _inspect_h5ad(object_path: Path) -> tuple[int | None, int | None, bool, str | None]:
+    """Inspect an h5ad file using only h5py to avoid loading data into RAM."""
     try:
-        adata = ad.read_h5ad(object_path, backed="r")
-        n_obs, n_vars = int(adata.n_obs), int(adata.n_vars)
-        embedding_keys = list(adata.obsm.keys())
-        adata.file.close()
-        if not embedding_keys:
-            return n_obs, n_vars, False, "No embeddings available for viewing."
-        return n_obs, n_vars, True, None
-    except Exception:
-        try:
-            with h5py.File(object_path, "r") as handle:
-                n_obs = None
-                n_vars = None
-                if "obs" in handle and "_index" in handle["obs"]:
-                    n_obs = int(handle["obs"]["_index"].shape[0])
-                if "var" in handle and "_index" in handle["var"]:
-                    n_vars = int(handle["var"]["_index"].shape[0])
-                elif "X" in handle:
-                    x = handle["X"]
-                    if isinstance(x, h5py.Dataset) and len(x.shape) == 2:
-                        n_vars = int(x.shape[1])
-                    elif isinstance(x, h5py.Group) and "shape" in x.attrs:
-                        shape = x.attrs["shape"]
-                        n_vars = int(shape[1])
-                missing = []
-                for key in ("var", "obsm"):
-                    if key not in handle:
-                        missing.append(key)
-                error = None
-                is_valid = len(missing) == 0
-                if not is_valid:
-                    error = f"Missing required groups for viewing: {', '.join(missing)}"
-                elif "obsm" in handle and len(handle["obsm"].keys()) == 0:
-                    is_valid = False
-                    error = "No embeddings available for viewing."
-                return n_obs, n_vars, is_valid, error
-        except Exception as inner_exc:
-            return None, None, False, f"Unreadable h5ad: {inner_exc}"
+        with h5py.File(object_path, "r") as handle:
+            n_obs: int | None = None
+            n_vars: int | None = None
+
+            # Cell count from obs index
+            if "obs" in handle:
+                obs_grp = handle["obs"]
+                if "_index" in obs_grp:
+                    n_obs = int(obs_grp["_index"].shape[0])
+                elif "__categories" not in obs_grp:
+                    # try first dataset we find
+                    for k in obs_grp:
+                        if isinstance(obs_grp[k], h5py.Dataset):
+                            n_obs = int(obs_grp[k].shape[0])
+                            break
+
+            # Gene count from var index or X shape
+            if "var" in handle:
+                var_grp = handle["var"]
+                if "_index" in var_grp:
+                    n_vars = int(var_grp["_index"].shape[0])
+            if n_vars is None and "X" in handle:
+                x = handle["X"]
+                if isinstance(x, h5py.Dataset) and len(x.shape) == 2:
+                    n_vars = int(x.shape[1])
+                elif isinstance(x, h5py.Group) and "shape" in x.attrs:
+                    shape = x.attrs["shape"]
+                    n_vars = int(shape[1])
+
+            missing = [k for k in ("var", "obsm") if k not in handle]
+            if missing:
+                return n_obs, n_vars, False, f"Missing required groups for viewing: {', '.join(missing)}"
+            if len(handle["obsm"].keys()) == 0:
+                return n_obs, n_vars, False, "No embeddings available for viewing."
+            return n_obs, n_vars, True, None
+    except Exception as exc:
+        return None, None, False, f"Unreadable h5ad: {exc}"
 
 
 class ObjectRegistry:
@@ -153,6 +153,20 @@ class ObjectRegistry:
             return self._records[object_id]
         except KeyError as exc:
             raise KeyError(f"Unknown object_id: {object_id}") from exc
+
+    def register_single(self, object_path: Path) -> list[ObjectRecord]:
+        """Register exactly one .h5ad file as the sole object in the registry."""
+        object_path = object_path.expanduser().resolve()
+        if not object_path.exists():
+            raise FileNotFoundError(f"Object file does not exist: {object_path}")
+        record = self.build_record(
+            object_path=object_path,
+            lineage_name=object_path.stem,
+            lineage_dir=object_path.parent,
+        )
+        self._records = {record.object_id: record}
+        self._scan_root = object_path.parent
+        return [record]
 
     @property
     def scan_root(self) -> Path | None:

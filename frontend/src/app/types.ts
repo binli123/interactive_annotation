@@ -1,3 +1,7 @@
+export type CapabilitiesResponse = {
+  has_global: boolean
+}
+
 export type ObjectCard = {
   object_id: string
   lineage_name: string
@@ -57,6 +61,7 @@ export type UmapResponse = {
   highlighted_total?: number | null
   highlighted_displayed?: number | null
   points: UmapPoint[]
+  view_token?: string | null
 }
 
 export type VisibleHighlightResponse = {
@@ -102,8 +107,6 @@ export type PolygonRecord = {
     n_cells: number
   }>
 }
-
-export type PaletteName = 'bright' | 'earth' | 'pastel'
 
 export type SessionSummary = {
   session_id: string
@@ -278,6 +281,7 @@ export type GeneExpressionResponse = {
     index: number
     value: number
   }>
+  ordered_values?: number[] | null
 }
 
 export type PointClusterResponse = {

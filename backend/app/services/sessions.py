@@ -164,13 +164,34 @@ class SessionStore:
     def _live_session_path(lineage_dir: Path, object_id: str) -> Path:
         return lineage_dir / f".live_session_{object_id}.json"
 
+    def _live_snapshot(self, session_id: str) -> dict[str, Any]:
+        """Like `session_sidecar`, but includes the full computed propagation
+        result (not just its parameters) so a backend restart between
+        "Propagate" finishing and the user clicking "Save now" doesn't lose
+        the computed assignment — only the .h5ad write itself still requires
+        an explicit Save."""
+        session = self.get(session_id)
+        sidecar = self.session_sidecar(session_id)
+        if session.last_propagation is not None:
+            snapshot = session.last_propagation
+            sidecar["last_propagation"] = {
+                **sidecar["last_propagation"],
+                "label_names": snapshot.label_names,
+                "assigned_labels": snapshot.assigned_labels.tolist(),
+                "assigned_scores": snapshot.assigned_scores.tolist(),
+                "assigned_margins": snapshot.assigned_margins.tolist(),
+                "eligible_mask": snapshot.eligible_mask.tolist(),
+                "assigned_mask": snapshot.assigned_mask.tolist(),
+            }
+        return sidecar
+
     def persist(self, session_id: str, lineage_dir: Path) -> None:
         """Write session to disk so it survives server restarts."""
         try:
             session = self.get(session_id)
         except KeyError:
             return
-        sidecar = self.session_sidecar(session_id)
+        sidecar = self._live_snapshot(session_id)
         path = self._live_session_path(lineage_dir, session.object_id)
         path.write_text(json.dumps(sidecar, indent=2))
 
@@ -228,6 +249,27 @@ class SessionStore:
                 session.seed_polygon_ids[idx] = set(poly_ids)
             except (ValueError, TypeError):
                 pass
+
+        propagation_data = data.get("last_propagation") or {}
+        if "assigned_labels" in propagation_data:
+            try:
+                session.last_propagation = PropagationSnapshot(
+                    label_names=list(propagation_data["label_names"]),
+                    assigned_labels=np.array(propagation_data["assigned_labels"], dtype=object),
+                    assigned_scores=np.array(propagation_data["assigned_scores"], dtype=float),
+                    assigned_margins=np.array(propagation_data["assigned_margins"], dtype=float),
+                    eligible_mask=np.array(propagation_data["eligible_mask"], dtype=bool),
+                    assigned_mask=np.array(propagation_data["assigned_mask"], dtype=bool),
+                    method=str(propagation_data.get("method", "")),
+                    scope=str(propagation_data.get("scope", "")),
+                    min_score=float(propagation_data.get("min_score", 0.0)),
+                    min_margin=float(propagation_data.get("min_margin", 0.0)),
+                    annotate_all=bool(propagation_data.get("annotate_all", False)),
+                    graph_smoothing=float(propagation_data.get("graph_smoothing", 0.0)),
+                    cluster_key=str(propagation_data.get("cluster_key", "")),
+                )
+            except (KeyError, ValueError, TypeError):
+                session.last_propagation = None
 
         self._sessions[session_id] = session
         return session

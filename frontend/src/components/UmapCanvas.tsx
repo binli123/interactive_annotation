@@ -3,7 +3,7 @@ import DeckGL from '@deck.gl/react'
 import { OrthographicView } from '@deck.gl/core'
 import { PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { useStore } from '../app/store'
-import type { PaletteName, PolygonRecord, UmapPoint } from '../app/types'
+import type { PolygonRecord, UmapPoint } from '../app/types'
 
 type ViewMode = 'lineage' | 'global'
 
@@ -17,16 +17,58 @@ type RenderPolygon = PolygonRecord & {
   displayVertices: [number, number][]
 }
 
-const palettes: Record<PaletteName, string[]> = {
-  bright: ['#0077b6', '#ef476f', '#06d6a0', '#f4a261', '#6a4c93', '#118ab2', '#8ac926', '#ff595e'],
-  earth: ['#355070', '#6d597a', '#b56576', '#e56b6f', '#eaac8b', '#7f5539', '#606c38', '#bc6c25'],
-  pastel: ['#7bdff2', '#b2f7ef', '#eff7f6', '#f7d6e0', '#f2b5d4', '#cdb4db', '#ffc8dd', '#bde0fe']
-}
+// Tier 1 (≤8 unique values): 8 bold, maximally distinct colors
+const TIER1: string[] = [
+  '#4e79a7', '#f28e2b', '#e15759', '#76b7b2',
+  '#59a14f', '#edc948', '#b07aa1', '#ff9da7',
+]
+
+// Tier 2 (9–18 unique values): 18 colors — Tableau 20 first 18
+const TIER2: string[] = [
+  '#4e79a7', '#a0cbe8', '#f28e2b', '#ffbe7d', '#59a14f', '#8cd17d',
+  '#b6992d', '#f1ce63', '#499894', '#86bcb6', '#e15759', '#ff9d9a',
+  '#79706e', '#bab0ac', '#d37295', '#fabfd2', '#b07aa1', '#d4a6c8',
+]
+
+// Tier 3 (>18 unique values): 40 colors — full-spectrum, capped at 40
+const TIER3: string[] = [
+  // Reds
+  '#e63946', '#c1121f', '#ff4d6d',
+  // Oranges
+  '#fb8500', '#ffb347', '#f4442e',
+  // Yellows
+  '#ffd60a', '#f7b731',
+  // Yellow-green
+  '#80b918', '#c5d86d',
+  // Greens
+  '#52b788', '#2d6a4f', '#1b4332', '#74c69d',
+  // Teals
+  '#2ec4b6', '#06d6a0',
+  // Cyans
+  '#48cae4', '#00b4d8',
+  // Blues
+  '#4cc9f0', '#4895ef', '#0077b6', '#4361ee', '#023e8a',
+  // Indigo/Violet
+  '#3a0ca3', '#480ca8', '#7209b7', '#560bad',
+  // Purples
+  '#8338ec', '#9b5de5', '#b5179e',
+  // Pinks
+  '#f72585', '#e91e8c', '#ff99c8', '#c77dff',
+  // Browns
+  '#774936', '#9b7451', '#d4a373',
+  // Neutrals
+  '#8d99ae', '#495057', '#bcbd22',
+]
 
 const umapView = new OrthographicView({ id: 'umap-view' })
 
-function colorForKey(value: string, paletteName: PaletteName): [number, number, number] {
-  const palette = palettes[paletteName]
+function pickPalette(uniqueCount: number): string[] {
+  if (uniqueCount <= 8) return TIER1
+  if (uniqueCount <= 18) return TIER2
+  return TIER3
+}
+
+function colorForKey(value: string, palette: string[]): [number, number, number] {
   let hash = 0
   for (let index = 0; index < value.length; index += 1) {
     hash = value.charCodeAt(index) + ((hash << 5) - hash)
@@ -57,8 +99,12 @@ function fitView(points: UmapPoint[]) {
   return { target: [cx, cy, 0], zoom }
 }
 
-function polygonColor(polygon: PolygonRecord, paletteName: PaletteName): [number, number, number, number] {
-  const [r, g, b] = colorForKey(polygon.clusterId || polygon.id, paletteName)
+function polygonColor(
+  polygon: PolygonRecord,
+  colorMap: Map<string, [number, number, number]>
+): [number, number, number, number] {
+  const key = polygon.clusterId || polygon.id
+  const [r, g, b] = colorMap.get(key) ?? [128, 128, 128]
   return [r, g, b, polygon.includeForPropagation ? 220 : 120]
 }
 
@@ -97,10 +143,10 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
     propagationResult: mode === 'lineage' ? store.propagationResult : undefined,
     colorMode: mode === 'lineage' ? store.colorMode : store.globalColorMode,
     clusterVisibility: mode === 'lineage' ? store.clusterVisibility : {},
+    clusterLabelEditor: mode === 'lineage' ? store.clusterLabelEditor : undefined,
     geneColorGene: mode === 'lineage' ? store.geneColorGene : store.globalGeneColorGene,
     pointSize: store.pointSize,
     pointOpacity: store.pointOpacity,
-    paletteName: store.paletteName,
     polygonStrokeWidth: store.polygonStrokeWidth,
     flipHorizontal: store.flipHorizontal,
     flipVertical: store.flipVertical,
@@ -118,6 +164,35 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
         : state.points,
     [mode, state.clusterVisibility, state.points]
   )
+  const palette = useMemo(() => {
+    if (state.colorMode === 'cluster' && state.clusterLabelEditor) {
+      return pickPalette(state.clusterLabelEditor.rows.length)
+    }
+    const colorKey = state.colorMode === 'annotation' ? 'annotationLabel' : 'cluster'
+    const unique = new Set(state.points.map((p) => (p as Record<string, unknown>)[colorKey] as string)).size
+    return pickPalette(unique)
+  }, [state.points, state.colorMode, state.clusterLabelEditor])
+
+  // Sequential assignment from sorted unique IDs — always built from displayed points so
+  // it covers every visible cluster even when clusterLabelEditor hasn't loaded yet.
+  // Sorting makes the assignment stable and guarantees no two clusters share a slot.
+  const clusterColorMap = useMemo((): Map<string, [number, number, number]> => {
+    const colorKey = state.colorMode === 'annotation' ? 'annotationLabel' : 'cluster'
+    const sortedIds = [...new Set(
+      state.points.map((p) => (p as Record<string, unknown>)[colorKey] as string)
+    )].sort()
+    return new Map(
+      sortedIds.map((id, index) => {
+        const hex = palette[index % palette.length].replace('#', '')
+        return [id, [
+          parseInt(hex.slice(0, 2), 16),
+          parseInt(hex.slice(2, 4), 16),
+          parseInt(hex.slice(4, 6), 16)
+        ]] as [string, [number, number, number]]
+      })
+    )
+  }, [state.points, state.colorMode, palette])
+
   const fit = useMemo(() => fitView(visibleBasePoints), [visibleBasePoints])
   const flipCenter = fit.target
   const [viewState, setViewState] = useState<{ target: number[]; zoom: number }>(fit)
@@ -210,7 +285,7 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
         getFillColor: (point: any) => {
           if (mode === 'global' && state.globalHighlight && state.colorMode !== 'gene') {
             if (point.is_highlighted) {
-              const [r, g, b] = colorForKey(state.globalHighlight.sourceClusterId, state.paletteName)
+              const [r, g, b] = colorForKey(state.globalHighlight.sourceClusterId, palette)
               return [r, g, b, 255]
             }
             return [178, 182, 188, 110]
@@ -224,7 +299,7 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
             return [r, g, b, Math.round(state.pointOpacity * 255)]
           }
           const key = state.colorMode === 'annotation' ? point.annotationLabel : point.cluster
-          const [r, g, b] = colorForKey(key, state.paletteName)
+          const [r, g, b] = clusterColorMap.get(key) ?? [128, 128, 128]
           return [r, g, b, Math.round(state.pointOpacity * 255)]
         },
         updateTriggers: {
@@ -233,7 +308,8 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
             mode,
             state.colorMode,
             state.globalHighlight?.sourceClusterId,
-            state.paletteName,
+            palette,
+            clusterColorMap,
             state.pointOpacity,
             state.geneColorGene
           ]
@@ -246,7 +322,8 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
       state.colorMode,
       state.geneColorGene,
       state.globalHighlight,
-      state.paletteName,
+      palette,
+      clusterColorMap,
       state.pointOpacity,
       state.pointSize
     ]
@@ -266,9 +343,9 @@ export default function UmapCanvas({ mode }: { mode: ViewMode }) {
         lineWidthMaxPixels: 16,
         getLineWidth: () => state.polygonStrokeWidth,
         getPolygon: (polygon: any) => polygon.displayVertices,
-        getLineColor: (polygon: any) => polygonColor(polygon, state.paletteName)
+        getLineColor: (polygon: any) => polygonColor(polygon, clusterColorMap)
       }),
-    [displayPolygons, mode, state.paletteName, state.polygonStrokeWidth]
+    [displayPolygons, mode, palette, clusterColorMap, state.polygonStrokeWidth]
   )
 
   const viewport = useMemo(

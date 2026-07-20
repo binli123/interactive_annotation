@@ -19,7 +19,6 @@ import type {
   ObjectCard,
   ObsColumnMeta,
   ObsValuesResponse,
-  PaletteName,
   PolygonRecord,
   PromoteReannotLabelsResponse,
   PropagateResponse,
@@ -109,6 +108,23 @@ function effectiveHighlightedGene(
   return selectedGenes.length === 1 ? selectedGenes[0] : undefined
 }
 
+// Rough, size-based duration estimates used only to animate the progress bar
+// (calibrated against measured timings on this app's largest real lineage
+// object, ~370k cells). The bar caps below 100% until the request actually
+// resolves, so an inaccurate estimate makes the bar pause near the end rather
+// than lie about completion.
+function estimatePropagateMs(nCells: number, method: 'graph_diffusion' | 'knn_vote'): number {
+  return method === 'graph_diffusion' ? 5000 + nCells * 0.02 : 6000 + nCells * 0.01
+}
+
+function estimateClusterSaveMs(nCells: number): number {
+  return 800 + nCells * 0.01
+}
+
+function estimateGeneColorMs(nDisplayedCells: number): number {
+  return 4000 + nDisplayedCells * 0.15
+}
+
 type PropagationScope =
   | 'polygon_only'
   | 'selected_clusters_only'
@@ -128,6 +144,17 @@ type GlobalHighlightState = {
 
 type ColorMode = 'cluster' | 'annotation' | 'gene'
 
+// Progress bar support for the three operations with real, size-dependent
+// latency (propagate, cluster-name save, gene coloring). `estimatedMs` is a
+// rough heuristic used only to animate the bar — the overlay always shows the
+// true elapsed time alongside it and never reports 100% before the request
+// actually resolves.
+export type TrackedTask = {
+  label: string
+  startedAt: number
+  estimatedMs: number
+}
+
 export type StoreState = {
   apiBase: string
   folderPath: string
@@ -136,6 +163,7 @@ export type StoreState = {
   activeViewMode: ViewMode
   metadata?: MetadataResponse
   points: UmapPoint[]
+  viewToken: string | null
   embeddingKey: string
   clusterKey: string
   maxPoints: number
@@ -144,6 +172,7 @@ export type StoreState = {
   globalMetadata?: MetadataResponse
   globalPoints: UmapPoint[]
   globalBasePoints: UmapPoint[]
+  globalViewToken: string | null
   globalEmbeddingKey: string
   globalClusterKey: string
   globalMaxPoints: number
@@ -169,7 +198,6 @@ export type StoreState = {
   pointSize: number
   pointOpacity: number
   polygonStrokeWidth: number
-  paletteName: PaletteName
   flipHorizontal: boolean
   flipVertical: boolean
   sessionId: string
@@ -215,10 +243,13 @@ export type StoreState = {
   annotationDiffResult?: AnnotationDiffResponse
   // F-03: live session restore
   liveSessionInfo?: LiveSessionResponse
+  hasGlobal: boolean
   busy: boolean
   busyMessage?: string
+  trackedTask?: TrackedTask
   error?: string
   scanFolder: () => Promise<void>
+  loadCapabilities: () => Promise<void>
   loadGlobalMetadata: () => Promise<void>
   selectObject: (objectId: string) => Promise<void>
   setActiveViewMode: (value: ViewMode) => void
@@ -244,7 +275,6 @@ export type StoreState = {
   setPointSize: (value: number) => void
   setPointOpacity: (value: number) => void
   setPolygonStrokeWidth: (value: number) => void
-  setPaletteName: (value: PaletteName) => void
   setFlipHorizontal: (value: boolean) => void
   setFlipVertical: (value: boolean) => void
   setClusterVisibility: (clusterId: string, visible: boolean) => void
@@ -341,6 +371,7 @@ export const useStore = create<StoreState>((set, get) => ({
   activeViewMode: 'lineage',
   metadata: undefined,
   points: [],
+  viewToken: null,
   embeddingKey: '',
   clusterKey: '',
   maxPoints: 50000,
@@ -349,6 +380,7 @@ export const useStore = create<StoreState>((set, get) => ({
   globalMetadata: undefined,
   globalPoints: [],
   globalBasePoints: [],
+  globalViewToken: null,
   globalEmbeddingKey: '',
   globalClusterKey: '',
   globalMaxPoints: 100000,
@@ -371,10 +403,9 @@ export const useStore = create<StoreState>((set, get) => ({
   minMargin: 0.1,
   annotateAll: true,
   graphSmoothing: 0.15,
-  pointSize: 2.2,
+  pointSize: 0.88,
   pointOpacity: 0.8,
   polygonStrokeWidth: 1.25,
-  paletteName: 'bright',
   flipHorizontal: false,
   flipVertical: false,
   sessionId: randomSessionId(),
@@ -415,9 +446,26 @@ export const useStore = create<StoreState>((set, get) => ({
   dashboardVisible: false,
   annotationDiffResult: undefined,
   liveSessionInfo: undefined,
+  hasGlobal: true,
   busy: false,
   busyMessage: undefined,
+  trackedTask: undefined,
   error: undefined,
+
+  async loadCapabilities() {
+    try {
+      const { has_global } = await api.getCapabilities(get().apiBase)
+      set({ hasGlobal: has_global })
+      if (!has_global && get().activeViewMode === 'global') {
+        set({ activeViewMode: 'lineage' })
+      }
+      if (has_global) {
+        await get().loadGlobalMetadata()
+      }
+    } catch {
+      set({ hasGlobal: false })
+    }
+  },
 
   async scanFolder() {
     if (!get().folderPath) return
@@ -452,6 +500,7 @@ export const useStore = create<StoreState>((set, get) => ({
         selectedObjectId: '',
         metadata: undefined,
         points: [],
+        viewToken: null,
         polygons: [],
         sessionSummary: undefined,
         clusterLabelEditor: undefined,
@@ -493,10 +542,12 @@ export const useStore = create<StoreState>((set, get) => ({
     set({
       busy: true,
       busyMessage: 'Loading object',
+      trackedTask: undefined,
       error: undefined,
       selectedObjectId: objectId,
       metadata: undefined,
       points: [],
+      viewToken: null,
       polygons: [],
       draftVertices: [],
       draftPolygonId: undefined,
@@ -549,7 +600,7 @@ export const useStore = create<StoreState>((set, get) => ({
             max_per_cluster: get().maxPerCluster,
             random_seed: 13
           })
-          .then((response) => set({ points: response.points })),
+          .then((response) => set({ points: response.points, viewToken: response.view_token ?? null })),
         api
           .getClusterLabelEditor(get().apiBase, objectId, nextClusterKey)
           .then((editor) => {
@@ -671,9 +722,6 @@ export const useStore = create<StoreState>((set, get) => ({
   },
   setPolygonStrokeWidth(value) {
     set({ polygonStrokeWidth: value })
-  },
-  setPaletteName(value) {
-    set({ paletteName: value })
   },
   setFlipHorizontal(value) {
     set({ flipHorizontal: value })
@@ -889,7 +937,7 @@ export const useStore = create<StoreState>((set, get) => ({
         max_per_cluster: maxPerCluster,
         random_seed: 13
       })
-      set({ points: response.points, busy: false, busyMessage: undefined })
+      set({ points: response.points, viewToken: response.view_token ?? null, busy: false, busyMessage: undefined })
     } catch (error) {
       set({
         busy: false,
@@ -916,10 +964,12 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     set({ busy: true, busyMessage: 'Loading global UMAP', error: undefined })
     try {
-      const response = await api.getGlobalUmap(get().apiBase, {
+      // Combined view: each lineage object contributes its own sampled subset,
+      // matched back into the global embedding — rather than an independent
+      // sample drawn straight from the global object.
+      const response = await api.getGlobalUmapCombined(get().apiBase, {
         embedding_key: nextEmbeddingKey,
         cluster_key: nextClusterKey || null,
-        gene_name: globalColorMode === 'gene' ? globalGeneColorGene ?? null : null,
         max_points: globalMaxPoints,
         min_per_cluster: globalMinPerCluster,
         max_per_cluster: globalMaxPerCluster,
@@ -928,10 +978,14 @@ export const useStore = create<StoreState>((set, get) => ({
       set({
         globalPoints: response.points,
         globalBasePoints: response.points,
+        globalViewToken: response.view_token ?? null,
         globalHighlight: undefined,
         busy: false,
         busyMessage: undefined
       })
+      if (globalColorMode === 'gene' && globalGeneColorGene) {
+        await get().colorBySelectedGene()
+      }
     } catch (error) {
       set({
         busy: false,
@@ -1287,7 +1341,7 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async saveClusterLabelEditor() {
-    const { selectedObjectId, clusterLabelEditor, clusterKey } = get()
+    const { selectedObjectId, clusterLabelEditor, clusterKey, metadata } = get()
     if (!selectedObjectId || !clusterLabelEditor || !clusterKey) {
       return
     }
@@ -1296,19 +1350,30 @@ export const useStore = create<StoreState>((set, get) => ({
         .map((row) => [row.cluster_id, (row.display_name ?? '').trim()] as const)
         .filter(([, displayName]) => displayName.length > 0)
     )
-    set({ busy: true, busyMessage: 'Saving cluster names', error: undefined, clusterLabelSaveResult: undefined })
+    set({
+      busy: true,
+      busyMessage: 'Saving cluster names',
+      trackedTask: {
+        label: 'Saving cluster names',
+        startedAt: Date.now(),
+        estimatedMs: estimateClusterSaveMs(metadata?.shape[0] ?? 50000)
+      },
+      error: undefined,
+      clusterLabelSaveResult: undefined
+    })
     try {
       const result = await api.saveClusterLabelEditor(get().apiBase, selectedObjectId, {
         cluster_key: clusterKey,
         display_column: clusterLabelEditor.display_column,
         mapping
       })
-      const metadata = await api.getMetadata(get().apiBase, selectedObjectId)
+      const nextMetadata = await api.getMetadata(get().apiBase, selectedObjectId)
       set({
-        metadata,
+        metadata: nextMetadata,
         clusterLabelSaveResult: result,
         busy: false,
-        busyMessage: undefined
+        busyMessage: undefined,
+        trackedTask: undefined
       })
       await get().loadObjectUndoStatus()
       await get().loadClusterLabelEditor()
@@ -1317,6 +1382,7 @@ export const useStore = create<StoreState>((set, get) => ({
       set({
         busy: false,
         busyMessage: undefined,
+        trackedTask: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -1542,11 +1608,13 @@ export const useStore = create<StoreState>((set, get) => ({
       activeHighlightedGene,
       selectedObjectId,
       points,
+      viewToken,
       geneColorGene,
       colorMode,
       activeViewMode,
       globalBasePoints,
       globalPoints,
+      globalViewToken,
       globalGeneColorGene,
       globalColorMode,
       geneCatalog,
@@ -1584,20 +1652,31 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ globalColorMode: 'gene' })
       return
     }
-    set({ busy: true, busyMessage: 'Loading gene colors', error: undefined })
+    const displayedCount = activeViewMode === 'global' ? (globalBasePoints.length || globalPoints.length) : points.length
+    set({
+      busy: true,
+      busyMessage: 'Loading gene colors',
+      trackedTask: {
+        label: `Coloring by ${gene}`,
+        startedAt: Date.now(),
+        estimatedMs: estimateGeneColorMs(displayedCount || 50000)
+      },
+      error: undefined
+    })
     try {
       if (activeViewMode === 'global') {
         const basePoints = globalBasePoints.length > 0 ? globalBasePoints : globalPoints
         const response = await api.getGlobalGeneExpression(get().apiBase, {
           gene_name: gene,
-          indices: basePoints.map((point) => point.index)
+          view_token: globalViewToken ?? undefined,
+          indices: globalViewToken ? undefined : basePoints.map((point) => point.index)
         })
-        const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
-        const nextPoints = basePoints.map((point) => ({
-          ...point,
-          gene_expression: expressionMap.get(point.index) ?? 0,
-          is_highlighted: undefined
-        }))
+        const nextPoints = response.ordered_values
+          ? basePoints.map((point, i) => ({ ...point, gene_expression: response.ordered_values![i] ?? 0, is_highlighted: undefined }))
+          : (() => {
+              const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
+              return basePoints.map((point) => ({ ...point, gene_expression: expressionMap.get(point.index) ?? 0, is_highlighted: undefined }))
+            })()
         set({
           globalBasePoints: nextPoints,
           globalPoints: nextPoints,
@@ -1605,29 +1684,42 @@ export const useStore = create<StoreState>((set, get) => ({
           globalColorMode: 'gene',
           globalGeneColorGene: gene,
           busy: false,
-          busyMessage: undefined
+          busyMessage: undefined,
+          trackedTask: undefined
         })
       } else {
         const response = await api.getGeneExpression(get().apiBase, selectedObjectId, {
           gene_name: gene,
-          indices: points.map((point) => point.index)
+          view_token: viewToken ?? undefined,
+          indices: viewToken ? undefined : points.map((point) => point.index)
         })
-        const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
-        set((state) => ({
-          points: state.points.map((point) => ({
-            ...point,
-            gene_expression: expressionMap.get(point.index) ?? 0
-          })),
-          colorMode: 'gene',
-          geneColorGene: gene,
-          busy: false,
-          busyMessage: undefined
-        }))
+        if (response.ordered_values) {
+          const orderedValues = response.ordered_values
+          set((state) => ({
+            points: state.points.map((point, i) => ({ ...point, gene_expression: orderedValues[i] ?? 0 })),
+            colorMode: 'gene',
+            geneColorGene: gene,
+            busy: false,
+            busyMessage: undefined,
+            trackedTask: undefined
+          }))
+        } else {
+          const expressionMap = new Map(response.values.map((row) => [row.index, row.value] as const))
+          set((state) => ({
+            points: state.points.map((point) => ({ ...point, gene_expression: expressionMap.get(point.index) ?? 0 })),
+            colorMode: 'gene',
+            geneColorGene: gene,
+            busy: false,
+            busyMessage: undefined,
+            trackedTask: undefined
+          }))
+        }
       }
     } catch (error) {
       set({
         busy: false,
         busyMessage: undefined,
+        trackedTask: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -1718,7 +1810,8 @@ export const useStore = create<StoreState>((set, get) => ({
       minScore,
       minMargin,
       annotateAll,
-      graphSmoothing
+      graphSmoothing,
+      metadata
     } = get()
 
     if (!selectedObjectId || !embeddingKey || !clusterKey) {
@@ -1738,6 +1831,11 @@ export const useStore = create<StoreState>((set, get) => ({
     set({
       busy: true,
       busyMessage: 'Propagating labels',
+      trackedTask: {
+        label: 'Propagating labels',
+        startedAt: Date.now(),
+        estimatedMs: estimatePropagateMs(metadata?.shape[0] ?? 50000, propagationMethod)
+      },
       error: undefined,
       sessionId,
       savePromptOpen: false,
@@ -1778,12 +1876,14 @@ export const useStore = create<StoreState>((set, get) => ({
         colorMode: 'annotation',
         savePromptOpen: true,
         busy: false,
-        busyMessage: undefined
+        busyMessage: undefined,
+        trackedTask: undefined
       })
     } catch (error) {
       set({
         busy: false,
         busyMessage: undefined,
+        trackedTask: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -1803,20 +1903,35 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async saveSession() {
-    const { selectedObjectId, sessionId, propagationResult } = get()
-    if (!selectedObjectId || !propagationResult) {
+    const { selectedObjectId, sessionId, propagationResult, sessionSummary, metadata } = get()
+    // propagationResult is only set by a propagate() call made in this browser
+    // session; a session restored after a backend restart only has
+    // sessionSummary.last_propagation. The backend is the real source of
+    // truth (the /save endpoint itself checks for a computed result) — this
+    // is just a friendly pre-check, so it must accept either.
+    if (!selectedObjectId || !(propagationResult || sessionSummary?.last_propagation)) {
       set({ error: 'Run propagation before saving.' })
       return
     }
-    set({ busy: true, busyMessage: 'Saving reannotated object', error: undefined })
+    set({
+      busy: true,
+      busyMessage: 'Saving reannotated object',
+      trackedTask: {
+        label: 'Saving reannotated object',
+        startedAt: Date.now(),
+        estimatedMs: estimateClusterSaveMs(metadata?.shape[0] ?? 50000)
+      },
+      error: undefined
+    })
     try {
       const saveResult = await api.save(get().apiBase, selectedObjectId, { session_id: sessionId })
-      set({ saveResult, savePromptOpen: false, busy: false, busyMessage: undefined })
+      set({ saveResult, savePromptOpen: false, busy: false, busyMessage: undefined, trackedTask: undefined })
       await get().loadObjectUndoStatus()
     } catch (error) {
       set({
         busy: false,
         busyMessage: undefined,
+        trackedTask: undefined,
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -1874,6 +1989,7 @@ export const useStore = create<StoreState>((set, get) => ({
     set({
       busy: false,
       busyMessage: undefined,
+      trackedTask: undefined,
       error: 'Stopped current request.'
     })
   },
@@ -2018,7 +2134,7 @@ export const useStore = create<StoreState>((set, get) => ({
         max_per_cluster: maxPerCluster,
         random_seed: 13
       })
-      set({ points: response.points, busy: false, busyMessage: undefined })
+      set({ points: response.points, viewToken: response.view_token ?? null, busy: false, busyMessage: undefined })
     } catch (error) {
       set({ busy: false, error: error instanceof Error ? error.message : String(error) })
     }

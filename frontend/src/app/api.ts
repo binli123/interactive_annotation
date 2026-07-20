@@ -1,5 +1,6 @@
 import type {
   AnnotationDiffResponse,
+  CapabilitiesResponse,
   ClusterLabelEditorResponse,
   DEResponse,
   DotplotResponse,
@@ -68,6 +69,9 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getCapabilities(baseUrl: string) {
+    return requestJson<CapabilitiesResponse>(`${baseUrl}/capabilities`)
+  },
   scanFolder(baseUrl: string, folderPath: string) {
     return requestJson<ObjectCard[]>(`${baseUrl}/scan-folder`, {
       method: 'POST',
@@ -89,13 +93,13 @@ export const api = {
   getGenes(baseUrl: string, objectId: string) {
     return requestJson<GeneCatalogResponse>(`${baseUrl}/objects/${objectId}/genes`)
   },
-  getGeneExpression(baseUrl: string, objectId: string, payload: { gene_name: string; indices: number[] }) {
+  getGeneExpression(baseUrl: string, objectId: string, payload: { gene_name: string; view_token?: string | null; indices?: number[] }) {
     return requestJson<GeneExpressionResponse>(`${baseUrl}/objects/${objectId}/gene-expression`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })
   },
-  getGlobalGeneExpression(baseUrl: string, payload: { gene_name: string; indices: number[] }) {
+  getGlobalGeneExpression(baseUrl: string, payload: { gene_name: string; view_token?: string | null; indices?: number[] }) {
     return requestJson<GeneExpressionResponse>(`${baseUrl}/global/gene-expression`, {
       method: 'POST',
       body: JSON.stringify(payload)
@@ -223,6 +227,23 @@ export const api = {
     }
   ) {
     return requestJson<UmapResponse>(`${baseUrl}/global/umap`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  },
+  getGlobalUmapCombined(
+    baseUrl: string,
+    payload: {
+      embedding_key: string
+      cluster_key?: string | null
+      gene_name?: string | null
+      max_points: number
+      min_per_cluster: number
+      max_per_cluster: number
+      random_seed: number
+    }
+  ) {
+    return requestJson<UmapResponse>(`${baseUrl}/global/umap-combined`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })
